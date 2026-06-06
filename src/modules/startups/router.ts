@@ -3,9 +3,9 @@ import { and, desc, eq, isNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { db } from '../../lib/db/index.ts'
 import { startups } from '../../lib/db/schema/index.ts'
+import { requireStartupOwner } from '../../lib/db/startup-queries.ts'
 import { requireAuth } from '../../middleware/auth.ts'
 import { zValidator } from '../../middleware/validate.ts'
-import { NotFoundError } from '../../middleware/errors.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
 export const startupsRouter = new Hono<HonoEnv>()
@@ -41,20 +41,6 @@ const updateStartupBody = z
   .refine((d) => Object.keys(d).length > 0, {
     message: 'At least one field must be provided',
   })
-
-// ── Ownership helper ──────────────────────────────────────────────────────────
-
-async function requireStartupOwner(startupId: string, userId: string) {
-  const startup = await db.query.startups.findFirst({
-    where: and(
-      eq(startups.id, startupId),
-      eq(startups.userId, userId),
-      isNull(startups.deletedAt),
-    ),
-  })
-  if (!startup) throw new NotFoundError()
-  return startup
-}
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -125,7 +111,7 @@ startupsRouter.patch(
     const [updated] = await db
       .update(startups)
       .set({ ...body, updatedAt: new Date() })
-      .where(eq(startups.id, id))
+      .where(and(eq(startups.id, id), eq(startups.userId, userId)))
       .returning()
 
     return c.json({ data: updated })
@@ -146,7 +132,7 @@ startupsRouter.delete(
     await db
       .update(startups)
       .set({ deletedAt: new Date(), updatedAt: new Date() })
-      .where(eq(startups.id, id))
+      .where(and(eq(startups.id, id), eq(startups.userId, userId)))
 
     return c.body(null, 204)
   },

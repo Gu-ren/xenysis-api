@@ -1,8 +1,9 @@
 import { Hono } from 'hono'
-import { and, asc, eq, isNull } from 'drizzle-orm'
+import { and, asc, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import { db } from '../../lib/db/index.ts'
-import { founderSessions, sessionAnswers, startups } from '../../lib/db/schema/index.ts'
+import { founderSessions, sessionAnswers } from '../../lib/db/schema/index.ts'
+import { requireStartupOwner } from '../../lib/db/startup-queries.ts'
 import { requireAuth } from '../../middleware/auth.ts'
 import { zValidator } from '../../middleware/validate.ts'
 import { BusinessRuleError, NotFoundError } from '../../middleware/errors.ts'
@@ -43,18 +44,6 @@ const addAnswerBody = z.object({
 })
 
 // ── Ownership helpers ─────────────────────────────────────────────────────────
-
-async function requireStartupOwner(startupId: string, userId: string) {
-  const startup = await db.query.startups.findFirst({
-    where: and(
-      eq(startups.id, startupId),
-      eq(startups.userId, userId),
-      isNull(startups.deletedAt),
-    ),
-  })
-  if (!startup) throw new NotFoundError()
-  return startup
-}
 
 async function requireSessionOwner(
   sessionId: string,
