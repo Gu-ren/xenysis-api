@@ -1,4 +1,4 @@
-import { check, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { check, decimal, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { questionTypeEnum, sessionStatusEnum } from './enums.ts'
 import { startups } from './startups.ts'
@@ -11,6 +11,10 @@ export const founderSessions = pgTable('founder_sessions', {
   userId: uuid('user_id').notNull(),
   idea: text('idea').notNull(),
   status: sessionStatusEnum('status').notNull().default('active'),
+  messagesCount: integer('messages_count').notNull().default(0),
+  sessionDurationSeconds: integer('session_duration_seconds'),
+  avgMessageLength: integer('avg_message_length'),
+  completionRate: decimal('completion_rate', { precision: 5, scale: 2 }),
   createdAt: timestamp('created_at', { withTimezone: true })
     .notNull()
     .defaultNow(),

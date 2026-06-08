@@ -6,6 +6,7 @@ import { startups } from '../../lib/db/schema/index.ts'
 import { requireStartupOwner } from '../../lib/db/startup-queries.ts'
 import { requireAuth } from '../../middleware/auth.ts'
 import { zValidator } from '../../middleware/validate.ts'
+import { logActivity } from '../../agents/base/utils.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
 export const startupsRouter = new Hono<HonoEnv>()
@@ -76,6 +77,14 @@ startupsRouter.post(
         lifecycleStage: 'founder-session',
       })
       .returning()
+
+    await logActivity(db, {
+      userId,
+      startupId: startup.id,
+      type: 'startup.created',
+      description: `Startup "${startup.name}" created`,
+      meta: { startupId: startup.id },
+    })
 
     return c.json({ data: startup }, 201)
   },

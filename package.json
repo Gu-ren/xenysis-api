@@ -11,16 +11,20 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
+    "db:seed": "tsx --env-file=.env scripts/seed.ts",
+    "db:reset": "tsx --env-file=.env scripts/reset-data.ts",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.102.0",
     "@hono/node-server": "^1.13.7",
     "@hono/zod-validator": "^0.4.3",
     "@supabase/supabase-js": "^2.47.10",
     "drizzle-orm": "^0.38.4",
     "hono": "^4.7.4",
+    "openai": "^6.42.0",
     "postgres": "^3.4.5",
     "zod": "^3.24.1"
   },

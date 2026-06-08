@@ -5,8 +5,22 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1749168000000,
-      "tag": "0000_xenysis_sprint1",
+      "when": 1780857662637,
+      "tag": "0000_xenysis_full_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1780865471560,
+      "tag": "0001_hard_captain_america",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1749340800000,
+      "tag": "0002_opportunity_constraints",
       "breakpoints": true
     }
   ]
