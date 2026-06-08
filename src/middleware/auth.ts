@@ -41,6 +41,7 @@ export const requireAuth: MiddlewareHandler<HonoEnv> = async (c, next) => {
   const { data: { user }, error } = await getAdminClient().auth.getUser(token)
 
   if (error || !user) {
+    console.error('[auth] getUser failed:', error?.message, error?.status)
     return c.json(UNAUTHENTICATED, 401)
   }
 

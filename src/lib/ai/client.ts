@@ -1,11 +1,10 @@
-// TODO(sprint-2): AI provider singletons
-//
-// Anthropic (BlueprintAgent, WorkspaceAgent):
-//   import Anthropic from '@anthropic-ai/sdk'
-//   export const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-//
-// OpenAI (OpportunityAgent, Founder Session interactions):
-//   import OpenAI from 'openai'
-//   export const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-//
-// Both keys are server-side only — never in NEXT_PUBLIC_* frontend variables.
+import Anthropic from '@anthropic-ai/sdk'
+import OpenAI from 'openai'
+
+// BlueprintAgent, WorkspaceAgent — tool_use + tool_choice pattern
+// Reads ANTHROPIC_API_KEY from env automatically
+export const anthropic = new Anthropic()
+
+// OpportunityAgent, Founder Session interactions — chat completions + JSON schema mode
+// Reads OPENAI_API_KEY from env automatically
+export const openai = new OpenAI()

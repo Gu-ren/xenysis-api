@@ -1,7 +1,15 @@
-// TODO(sprint-2): Activity log table
-//
-//   activity_log
-//     Columns: id, user_id, startup_id (nullable FK → startups),
-//              type, description, meta (JSONB), created_at
-//     Append-only — never updated after insert.
-//     Indexed on (user_id, created_at DESC) and (startup_id, created_at DESC).
+import { jsonb, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { startups } from './startups.ts'
+
+export const activityLog = pgTable('activity_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull(),
+  startupId: uuid('startup_id').references(() => startups.id),
+  type: text('type').notNull(),
+  description: text('description').notNull(),
+  meta: jsonb('meta'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
+export type ActivityLogEntry = typeof activityLog.$inferSelect
+export type NewActivityLogEntry = typeof activityLog.$inferInsert
