@@ -104,6 +104,7 @@ export async function persistAssessment(
   })
 
   // ── Activity log (best-effort, outside transaction) ───────────────────────
+  // .catch() ensures a log write failure never rolls back a committed assessment.
   await logActivity(db, {
     userId,
     startupId,
@@ -118,7 +119,7 @@ export async function persistAssessment(
       confidenceScore:  validatedContent.confidenceScore,
       recommendation:   validatedContent.recommendation.action,
     },
-  })
+  }).catch(() => {})
 
   return result
 }
