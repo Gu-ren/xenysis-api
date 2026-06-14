@@ -29,14 +29,14 @@ const idParam = z.object({ id: z.string().uuid('Invalid startup ID') })
 
 const createStartupBody = z.object({
   name: z.string().min(1, 'Name is required').max(255),
-  description: z.string().max(500).optional(),
+  description: z.string().max(2000, 'Description must be 2000 characters or fewer').optional(),
   category: categoryEnum.optional(),
 })
 
 const updateStartupBody = z
   .object({
     name: z.string().min(1).max(255).optional(),
-    description: z.string().max(500).nullable().optional(),
+    description: z.string().max(2000, 'Description must be 2000 characters or fewer').nullable().optional(),
     category: categoryEnum.nullable().optional(),
   })
   .refine((d) => Object.keys(d).length > 0, {

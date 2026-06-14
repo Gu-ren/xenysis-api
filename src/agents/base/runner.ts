@@ -3,6 +3,7 @@ import type Anthropic from '@anthropic-ai/sdk'
 import type OpenAI from 'openai'
 import type { DB } from '../../lib/db/index.ts'
 import { generationJobs } from '../../lib/db/schema/index.ts'
+import type { AIProvider } from '../../lib/ai/adapters/index.ts'
 import type { Agent, AgentInput } from './agent.interface.ts'
 import { type GenerationEvent, errorEvent, logEvent } from './events.ts'
 
@@ -62,11 +63,14 @@ export async function* runAgent<TInput extends AgentInput, TOutput>(
     .set({ status: 'active', startedAt: new Date() })
     .where(eq(generationJobs.id, job.id))
 
+  // provider is stored explicitly on the job row — never inferred from model name.
+  const provider = job.provider as AIProvider
+
   let lastError: unknown
 
   for (let attempt = 1; attempt <= job.maxAttempts; attempt++) {
     try {
-      const gen = agent.execute({ input, db, anthropic, openai })
+      const gen = agent.execute({ input, db, anthropic, openai, model: job.model, provider })
 
       for await (const event of gen) {
         if (event.type === 'stage' || event.type === 'progress') {

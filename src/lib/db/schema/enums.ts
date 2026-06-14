@@ -62,6 +62,11 @@ export const aiPurposeEnum = pgEnum('ai_purpose', [
   'preview_gen',
 ])
 
+export const aiProviderEnum = pgEnum('ai_provider', [
+  'openai',
+  'anthropic',
+])
+
 export const releaseStatusEnum = pgEnum('release_status', [
   'queued',
   'in_progress',
@@ -83,5 +88,6 @@ export type StartupCategory     = typeof startupCategoryEnum.enumValues[number]
 export type GenerationJobType   = typeof generationJobTypeEnum.enumValues[number]
 export type GenerationJobStatus = typeof generationJobStatusEnum.enumValues[number]
 export type AiPurpose           = typeof aiPurposeEnum.enumValues[number]
+export type AIProvider          = typeof aiProviderEnum.enumValues[number]
 export type ReleaseStatus       = typeof releaseStatusEnum.enumValues[number]
 export type EnvironmentName     = typeof environmentNameEnum.enumValues[number]

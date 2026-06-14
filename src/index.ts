@@ -4,6 +4,7 @@ import { cors } from 'hono/cors'
 import { secureHeaders } from 'hono/secure-headers'
 import { authRouter } from './modules/auth/router.ts'
 import { founderSessionsRouter } from './modules/founder-sessions/router.ts'
+import { opportunityRouter } from './modules/opportunity/router.ts'
 import { startupsRouter } from './modules/startups/router.ts'
 import { errorResponse } from './middleware/errors.ts'
 import type { HonoEnv } from './types/hono.ts'
@@ -38,16 +39,18 @@ const v1 = new Hono<HonoEnv>()
 v1.route('/auth', authRouter)
 v1.route('/startups', startupsRouter)
 
-// Founder sessions are nested under startups (/startups/:id/sessions/*)
+// Founder sessions and opportunity assessments are nested under startups
 v1.route('/startups', founderSessionsRouter)
+v1.route('/startups', opportunityRouter)
 
-// TODO(sprint-3): v1.route('/startups', opportunityRouter)
+// TODO(sprint-4): v1.route('/startups', blueprintRouter)
 // TODO(sprint-4): v1.route('/startups', blueprintRouter)
 // TODO(sprint-5): v1.route('/startups', workspaceRouter)
 // TODO(sprint-3): v1.route('/startups', generationRouter)
 // TODO(sprint-5): v1.route('/startups', deployRouter)
 // TODO(sprint-2): v1.route('/startups', activityRouter)
 // TODO(sprint-3): v1.route('/usage', usageRouter)
+
 
 app.route('/api/v1', v1)
 
