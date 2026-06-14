@@ -150,13 +150,17 @@ export function buildChatSystemPrompt(
       lines.push(
         '',
         '--- SESSION MODE: GAP IDENTIFICATION ---',
-        'The startup is well understood. Remaining weak areas have been confirmed as not-yet-validated.',
-        'Do NOT ask for more evidence or validation. Instead:',
-        '1. Acknowledge what has been learned about the startup.',
-        '2. Name the specific assumptions that remain unvalidated.',
-        '3. Suggest what the founder should test next to build confidence.',
-        '4. Invite them to proceed to their Opportunity Assessment.',
-        'The Opportunity Assessment will surface these gaps formally with next-step guidance.',
+        'The core areas are partially understood but the session is NOT yet complete.',
+        'Problem, Customer, and Solution must each reach 80% confidence before the session closes.',
+        'Do NOT tell the founder they can proceed to the Opportunity Assessment.',
+        'Do NOT imply the session is finished.',
+        'Do NOT offer any alternative path or early exit.',
+        'Instead, do all of the following in one response:',
+        '1. Briefly summarize what is known so far about the startup (2–3 sentences max).',
+        '2. Name the specific assumptions that remain unvalidated — be concrete.',
+        '3. Clearly state that the session is not yet complete and what is still needed.',
+        '4. Ask the founder which of the weaker areas they would like to explore next.',
+        'Do NOT skip step 3. Do NOT offer an early assessment. Continue discovery.',
       )
     } else {
       const weakest      = understanding.weakestCategory
