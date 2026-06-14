@@ -53,11 +53,13 @@ export class OpportunityAgent implements Agent<OpportunityAgentInput, Opportunit
 
     const systemPrompt = buildSystemPrompt()
     const userMessage  = buildUserMessage({
-      startup:         input.startup,
-      founderMemory:   input.founderMemory,
-      understanding:   input.understanding,
-      evidenceRecords: trimmedEvidence,
-      latestSummary:   input.latestSummary,
+      startup:               input.startup,
+      founderMemory:         input.founderMemory,
+      understanding:         input.understanding,
+      evidenceRecords:       trimmedEvidence,
+      preComputedConfidence: input.preComputedConfidence,
+      preComputedGaps:       input.preComputedGaps,
+      latestSummary:         input.latestSummary,
     })
 
     yield stageEvent('collecting-context', 'Collecting context', 'Reading founder memory and evidence records', 'done')
@@ -98,6 +100,28 @@ export class OpportunityAgent implements Agent<OpportunityAgentInput, Opportunit
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       throw new Error(`Opportunity assessment failed schema validation: ${message}`)
+    }
+
+    // ── Score arithmetic enforcement ─────────────────────────────────────────
+    // The LLM is instructed to set opportunityScore equal to the weighted sum
+    // of scoreBreakdown dimensions. We verify this deterministically and correct
+    // any deviation. Chosen behavior: log a warning and use the computed value —
+    // deterministic arithmetic is more trustworthy than LLM rounding.
+    if (content.scoreBreakdown) {
+      const { problemStrength, customerClarity, marketPotential, competitiveAdvantage, founderFit } = content.scoreBreakdown
+      const computedScore = Math.round(
+        problemStrength.score      * 0.25 +
+        customerClarity.score      * 0.25 +
+        marketPotential.score      * 0.20 +
+        competitiveAdvantage.score * 0.15 +
+        founderFit.score           * 0.15,
+      )
+      if (computedScore !== content.opportunityScore) {
+        console.warn(
+          `[OpportunityAgent] opportunityScore mismatch: LLM=${content.opportunityScore} computed=${computedScore} — correcting to computed value`,
+        )
+        content = { ...content, opportunityScore: computedScore }
+      }
     }
 
     yield stageEvent('validating-results', 'Validating results', 'Parsing and validating model output', 'done')

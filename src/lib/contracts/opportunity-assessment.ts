@@ -1,6 +1,6 @@
 import { z } from 'zod'
 
-export const OPPORTUNITY_ASSESSMENT_SCHEMA_VERSION = '1.0' as const
+export const OPPORTUNITY_ASSESSMENT_SCHEMA_VERSION = '2.0' as const
 
 // ── Rating scale ──────────────────────────────────────────────────────────────
 // Qualitative labels for sub-dimension ratings.
@@ -25,7 +25,20 @@ export type RecommendationAction = z.infer<typeof RecommendationActionSchema>
 export const RiskSeveritySchema = z.enum(['low', 'medium', 'high', 'critical'])
 export type RiskSeverity = z.infer<typeof RiskSeveritySchema>
 
-// ── Sub-objects ───────────────────────────────────────────────────────────────
+// ── Assessment tier ───────────────────────────────────────────────────────────
+// Mirrors AssessmentTierSchema from founder-understanding.ts but defined here
+// so the assessment contract is self-contained (no cross-contract imports at runtime).
+export const AssessmentTierSchema = z.enum(['unknown', 'gap', 'assumption_based', 'validated'])
+export type AssessmentTier = z.infer<typeof AssessmentTierSchema>
+
+// ── Understanding categories (for evidence breakdown references) ───────────────
+export const UNDERSTANDING_CATEGORY_ENUM = z.enum([
+  'problem', 'customer', 'solution', 'market',
+  'pricing', 'competition', 'risks', 'founder_fit',
+])
+export type UnderstandingCategory = z.infer<typeof UNDERSTANDING_CATEGORY_ENUM>
+
+// ── Sub-objects (existing, unchanged) ────────────────────────────────────────
 
 export const MarketPotentialSchema = z.object({
   size:      RatingSchema,
@@ -59,11 +72,6 @@ export type CompetitiveAdvantage = z.infer<typeof CompetitiveAdvantageSchema>
 // ── Key risks ─────────────────────────────────────────────────────────────────
 // category ties each risk back to an UnderstandingCategory so the UI can join
 // risks to the category confidence/validation state without inference.
-export const UNDERSTANDING_CATEGORY_ENUM = z.enum([
-  'problem', 'customer', 'solution', 'market',
-  'pricing', 'competition', 'risks', 'founder_fit',
-])
-
 export const KeyRiskSchema = z.object({
   category:    UNDERSTANDING_CATEGORY_ENUM,
   title:       z.string().max(120),
@@ -96,10 +104,84 @@ export const RecommendationSchema = z.object({
 })
 export type Recommendation = z.infer<typeof RecommendationSchema>
 
+// ── v2.0: Score Breakdown ─────────────────────────────────────────────────────
+// Sub-dimensions that compose opportunityScore. Weights sum to 100.
+// The LLM outputs each dimension score; opportunityScore must equal the weighted sum.
+
+export const ScoreDimensionSchema = z.object({
+  score:     z.number().int().min(0).max(100),
+  weight:    z.number().int().min(1).max(40),    // % contribution to opportunityScore
+  rationale: z.string().max(300),                 // why this dimension scored this way
+  tier:      AssessmentTierSchema,                // evidence quality backing this dimension
+})
+export type ScoreDimension = z.infer<typeof ScoreDimensionSchema>
+
+export const ScoreBreakdownSchema = z.object({
+  problemStrength:      ScoreDimensionSchema,   // weight: 25
+  customerClarity:      ScoreDimensionSchema,   // weight: 25
+  marketPotential:      ScoreDimensionSchema,   // weight: 20
+  competitiveAdvantage: ScoreDimensionSchema,   // weight: 15
+  founderFit:           ScoreDimensionSchema,   // weight: 15
+})
+export type ScoreBreakdown = z.infer<typeof ScoreBreakdownSchema>
+
+// ── v2.0: Confidence Breakdown ────────────────────────────────────────────────
+// Per-category evidence quality that drives the confidence score.
+// Pre-computed deterministically; LLM receives computedScore as anchor.
+
+export const CategoryEvidenceQualitySchema = z.object({
+  category:         UNDERSTANDING_CATEGORY_ENUM,
+  tier:             AssessmentTierSchema,
+  evidenceStrength: z.number().int().min(1).max(6),
+  confidence:       z.number().int().min(0).max(100),
+  // Effective quality: min(confidence, strengthCeiling) with gap penalty applied
+  qualityScore:     z.number().int().min(0).max(100),
+  // Human-readable: "Strong — externally validated", "Assumption — founder theory only", etc.
+  label:            z.string().max(120),
+})
+export type CategoryEvidenceQuality = z.infer<typeof CategoryEvidenceQualitySchema>
+
+export const ConfidenceBreakdownSchema = z.object({
+  categories:           z.array(CategoryEvidenceQualitySchema),
+  strongCategories:     z.array(UNDERSTANDING_CATEGORY_ENUM),
+  weakCategories:       z.array(UNDERSTANDING_CATEGORY_ENUM),
+  missingCategories:    z.array(UNDERSTANDING_CATEGORY_ENUM),
+  // Deterministic score computed before the LLM call — the anchor.
+  computedScore:        z.number().int().min(0).max(100),
+  // Present when the LLM's final confidenceScore deviates > 10 pts from computedScore.
+  adjustmentRationale:  z.string().max(400).nullable().optional(),
+})
+export type ConfidenceBreakdown = z.infer<typeof ConfidenceBreakdownSchema>
+
+// ── v2.0: Validation Gap Summary ─────────────────────────────────────────────
+// Structured output of what evidence is missing, pre-computed before the LLM call.
+// The LLM outputs this verbatim (it was assembled from founder_understanding data).
+
+export const ValidationGapSchema = z.object({
+  category:        UNDERSTANDING_CATEGORY_ENUM,
+  tier:            AssessmentTierSchema,
+  gapDescription:  z.string().max(300),
+  riskIfUnfilled:  z.string().max(300),
+  priority:        z.number().int().min(1).max(5),
+  suggestedAction: z.string().max(300),
+})
+export type ValidationGap = z.infer<typeof ValidationGapSchema>
+
+export const ValidationGapSummarySchema = z.object({
+  gaps:             z.array(ValidationGapSchema).max(8),
+  evidenceStrength: z.string().max(60),   // human label, e.g. "Founder assumption only (1/6)"
+  overallGapRisk:   z.enum(['low', 'medium', 'high', 'critical']),
+})
+export type ValidationGapSummary = z.infer<typeof ValidationGapSummarySchema>
+
 // ── Root schema ───────────────────────────────────────────────────────────────
+// _schemaVersion union allows backward-compatible reads of v1.0 rows.
+// New generations always produce v2.0 (enforced by the JSON schema in schemas.ts).
+// All v2.0 fields are optional so v1.0 rows parse without error — the Zod contract
+// is a read contract; the write contract (JSON schema) enforces v2.0 at generation time.
 
 export const OpportunityAssessmentContentSchema = z.object({
-  _schemaVersion: z.literal('1.0').default('1.0'),
+  _schemaVersion: z.union([z.literal('1.0'), z.literal('2.0')]),
 
   // Rendered as the top-of-report summary card.
   executiveSummary: z.string().min(1).max(1000),
@@ -108,8 +190,8 @@ export const OpportunityAssessmentContentSchema = z.object({
   // A strong opportunity with thin evidence scores high here but low on confidenceScore.
   opportunityScore: z.number().int().min(0).max(100),
 
-  // LLM's epistemic confidence in the assessment, bounded by evidence quality.
-  // Surfaces a "low confidence" warning in the UI when < 50.
+  // LLM's epistemic confidence, bounded by the pre-computed evidence quality.
+  // In v2.0 this should stay within ±15 of confidenceBreakdown.computedScore.
   confidenceScore: z.number().int().min(0).max(100),
 
   marketPotential:      MarketPotentialSchema,
@@ -123,5 +205,10 @@ export const OpportunityAssessmentContentSchema = z.object({
   validationPlan: z.array(ValidationStepSchema).min(3).max(5),
 
   recommendation: RecommendationSchema,
+
+  // v2.0 explainability fields — optional for backward compat with existing v1.0 rows.
+  scoreBreakdown:       ScoreBreakdownSchema.optional(),
+  confidenceBreakdown:  ConfidenceBreakdownSchema.optional(),
+  validationGapSummary: ValidationGapSummarySchema.optional(),
 })
 export type OpportunityAssessmentContent = z.infer<typeof OpportunityAssessmentContentSchema>

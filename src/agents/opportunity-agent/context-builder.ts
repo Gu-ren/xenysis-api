@@ -16,6 +16,8 @@ import {
   FounderUnderstandingSchema,
 } from '../../lib/contracts/founder-understanding.ts'
 import { SessionSummarySchema } from '../../lib/contracts/session-summary.ts'
+import { computeEvidenceConfidence } from '../../lib/evidence/confidence.ts'
+import { computeValidationGaps } from '../../lib/evidence/gaps.ts'
 import { NotFoundError } from '../../middleware/errors.ts'
 import type { OpportunityAgentInput } from './input-contract.ts'
 
@@ -69,6 +71,11 @@ export async function buildOpportunityContext(
     ? SessionSummarySchema.safeParse(summaryRow.summary).data
     : undefined
 
+  // Pre-compute evidence quality and validation gaps before the LLM call.
+  // Both are pure functions — no additional DB queries required.
+  const preComputedConfidence = computeEvidenceConfidence(understanding)
+  const preComputedGaps       = computeValidationGaps(understanding)
+
   return {
     userId,
     startupId,
@@ -78,6 +85,8 @@ export async function buildOpportunityContext(
     founderMemory,
     understanding,
     evidenceRecords: evidenceRows,
+    preComputedConfidence,
+    preComputedGaps,
     latestSummary,
   }
 }

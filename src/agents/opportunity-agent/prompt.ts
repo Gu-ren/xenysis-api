@@ -1,6 +1,7 @@
 import type { FounderMemory } from '../../lib/contracts/founder-memory.ts'
 import type { FounderUnderstanding, UnderstandingCategory } from '../../lib/contracts/founder-understanding.ts'
 import type { SessionSummary } from '../../lib/contracts/session-summary.ts'
+import type { ConfidenceBreakdown, ValidationGapSummary } from '../../lib/contracts/opportunity-assessment.ts'
 import type { EvidenceRecordRow } from '../../lib/db/schema/understanding.ts'
 import type { Startup } from '../../lib/db/schema/startups.ts'
 import {
@@ -9,35 +10,31 @@ import {
   EVIDENCE_STRENGTH_LEVELS,
   REQUIRED_CATEGORIES,
 } from '../../lib/contracts/founder-understanding.ts'
+import {
+  renderConfidenceBreakdownPromptBlock,
+} from '../../lib/evidence/confidence.ts'
+import {
+  renderValidationGapsPromptBlock,
+} from '../../lib/evidence/gaps.ts'
 
-export const PROMPT_VERSION = 'opportunity-v1.0' as const
+export const PROMPT_VERSION = 'opportunity-v2.0' as const
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const PER_CATEGORY_CAP = 3
 const TOTAL_CAP        = 30
 
 // ── truncate ──────────────────────────────────────────────────────────────────
-// Enforces a character budget on any string injected into the prompt.
-// Appends '…' so readers know the value was cut, not missing.
 function truncate(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value
   return value.slice(0, maxChars - 1) + '…'
 }
 
 // ── strengthLabel ─────────────────────────────────────────────────────────────
-// Safe lookup into EVIDENCE_STRENGTH_LEVELS for a raw number from EvidenceRecordRow.
 function strengthLabel(strength: number): string {
   return EVIDENCE_STRENGTH_LEVELS[strength as keyof typeof EVIDENCE_STRENGTH_LEVELS] ?? 'Unknown'
 }
 
 // ── collapseRepetitiveRecords ─────────────────────────────────────────────────
-// Within a single-category bucket, clusters records by normalized evidence text.
-// Clusters of size > 1 are collapsed into a single synthetic record:
-//   evidence = "N independent signals: <original text>"
-//   evidenceStrength = max of the cluster
-//   noveltySignal = 'new'  (collapsed signal is no longer repetitive noise)
-// Single records pass through unchanged.
-// Repeated evidence is a validation signal — collapse, do not discard.
 function collapseRepetitiveRecords(bucket: EvidenceRecordRow[]): EvidenceRecordRow[] {
   const clusters = new Map<string, EvidenceRecordRow[]>()
 
@@ -56,9 +53,9 @@ function collapseRepetitiveRecords(bucket: EvidenceRecordRow[]): EvidenceRecordR
       continue
     }
 
-    const representative   = cluster[0]
-    const maxStrength      = cluster.reduce((m, r) => Math.max(m, r.evidenceStrength), 1)
-    const maxImpact        = cluster.reduce((m, r) => Math.max(m, r.confidenceImpact), 0)
+    const representative = cluster[0]
+    const maxStrength    = cluster.reduce((m, r) => Math.max(m, r.evidenceStrength), 1)
+    const maxImpact      = cluster.reduce((m, r) => Math.max(m, r.confidenceImpact), 0)
 
     result.push({
       ...representative,
@@ -73,14 +70,6 @@ function collapseRepetitiveRecords(bucket: EvidenceRecordRow[]): EvidenceRecordR
 }
 
 // ── trimEvidenceRecords ───────────────────────────────────────────────────────
-// Token-budget protection for evidence_records injected into the prompt.
-//
-// Strategy:
-//   1. Group records by category.
-//   2. Collapse near-duplicate records within each category (repeated = signal, not noise).
-//   3. Sort by evidenceStrength DESC, then confidenceImpact DESC.
-//   4. Keep top PER_CATEGORY_CAP per category.
-//   5. Hard cap total at TOTAL_CAP, strongest records first across all categories.
 export function trimEvidenceRecords(records: EvidenceRecordRow[]): EvidenceRecordRow[] {
   const byCategory = new Map<string, EvidenceRecordRow[]>()
   for (const r of records) {
@@ -108,8 +97,6 @@ export function trimEvidenceRecords(records: EvidenceRecordRow[]): EvidenceRecor
 }
 
 // ── renderEvidenceSection ─────────────────────────────────────────────────────
-// Formats the trimmed evidence records into a grouped, readable prompt block.
-// Records are rendered in UNDERSTANDING_CATEGORIES order for consistency.
 function renderEvidenceSection(records: EvidenceRecordRow[]): string[] {
   if (records.length === 0) return []
 
@@ -137,9 +124,6 @@ function renderEvidenceSection(records: EvidenceRecordRow[]): string[] {
 }
 
 // ── buildEvidenceQualitySummary ───────────────────────────────────────────────
-// Derives confidence calibration guidance from raw EvidenceRecordRow[] data.
-// Anchored to what was literally extracted from conversation — not the
-// interpretation layer in FounderUnderstanding.category_evidence_strength.
 function buildEvidenceQualitySummary(records: EvidenceRecordRow[]): string[] {
   const lines: string[] = ['=== EVIDENCE QUALITY SUMMARY (primary confidence calibration anchor) ===']
 
@@ -150,49 +134,29 @@ function buildEvidenceQualitySummary(records: EvidenceRecordRow[]): string[] {
     return lines
   }
 
-  // Per-category max strength derived from raw records.
   const maxStrengthByCategory = new Map<string, number>()
   for (const r of records) {
     const current = maxStrengthByCategory.get(r.category) ?? 0
     if (r.evidenceStrength > current) maxStrengthByCategory.set(r.category, r.evidenceStrength)
   }
 
-  const requiredCats         = REQUIRED_CATEGORIES as readonly UnderstandingCategory[]
-  const requiredStrengths    = requiredCats.map((cat) => maxStrengthByCategory.get(cat) ?? 1)
-  const maxRequiredStrength  = requiredStrengths.reduce((m, s) => Math.max(m, s), 1)
-  const allStrengths         = Array.from(maxStrengthByCategory.values())
-  const maxOverallStrength   = allStrengths.reduce((m, s) => Math.max(m, s), 1)
-  const requiredAllWeak      = requiredStrengths.every((s) => s <= 2)
-  const highQualityCount     = records.filter((r) => r.evidenceStrength >= 3).length
+  const requiredCats        = REQUIRED_CATEGORIES as readonly UnderstandingCategory[]
+  const requiredStrengths   = requiredCats.map((cat) => maxStrengthByCategory.get(cat) ?? 1)
+  const maxRequiredStrength = requiredStrengths.reduce((m, s) => Math.max(m, s), 1)
+  const allStrengths        = Array.from(maxStrengthByCategory.values())
+  const maxOverallStrength  = allStrengths.reduce((m, s) => Math.max(m, s), 1)
+  const requiredAllWeak     = requiredStrengths.every((s) => s <= 2)
+  const highQualityCount    = records.filter((r) => r.evidenceStrength >= 3).length
 
   lines.push(`Evidence records (after trimming): ${records.length}`)
   lines.push(`High-quality records (strength ≥ 3, customer conversations or better): ${highQualityCount} of ${records.length}`)
   lines.push(`Highest strength — required categories (problem/customer/solution): ${maxRequiredStrength}/6 (${strengthLabel(maxRequiredStrength)})`)
   lines.push(`Highest strength — all categories: ${maxOverallStrength}/6 (${strengthLabel(maxOverallStrength)})`)
   lines.push('')
-  lines.push('Soft confidence ceilings (calibration guidance — apply judgment, not hard arithmetic):')
-
-  if (maxOverallStrength <= 1) {
-    lines.push('  All evidence is founder assumption. Confidence generally should not exceed 25.')
-    lines.push('  No external signal exists to anchor the assessment.')
-  } else if (maxOverallStrength === 2) {
-    lines.push('  Strongest evidence is anecdotal observation. Confidence generally should not exceed 40.')
-    lines.push('  Pattern recognition is present but no structured validation has occurred.')
-  } else if (maxOverallStrength === 3) {
-    lines.push('  Founder has held customer conversations. Confidence generally should not exceed 60.')
-    lines.push('  Signals are directional but not yet systematically tested.')
-  } else if (maxOverallStrength === 4) {
-    lines.push('  Structured customer interviews conducted. Confidence generally should not exceed 78.')
-  } else if (maxOverallStrength === 5) {
-    lines.push('  Paying customers present. Confidence can reach 90+ if evidence is broad and consistent.')
-  } else {
-    lines.push('  Usage or revenue data available. High confidence is warranted when evidence is consistent.')
-  }
 
   if (requiredAllWeak) {
-    lines.push('')
     lines.push('  IMPORTANT: Required categories (problem/customer/solution) have only assumption-level')
-    lines.push('  or anecdotal evidence from the record set. Consider reducing confidence by ~15 points.')
+    lines.push('  or anecdotal evidence. Consider reducing confidence by ~15 points.')
     lines.push('  The core thesis has not been tested against external reality.')
   }
 
@@ -212,6 +176,7 @@ export function buildSystemPrompt(): string {
     '  - Scored per-category confidence (0-100) and evidence strength (1-6)',
     '  - Identified validation gaps (categories the founder confirmed have no external evidence)',
     '  - Curated and collapsed evidence records by quality and novelty',
+    '  - Pre-computed a deterministic confidence breakdown and validation gap list (see user message)',
     '',
     'Your job is synthesis, not extraction. Judge the opportunity using all available signals.',
     '',
@@ -226,36 +191,60 @@ export function buildSystemPrompt(): string {
     '',
     'CONFIDENCE SCORE (0-100):',
     '  Measures epistemic trust in the assessment — how much to believe the opportunityScore.',
-    '  This is not a quality score. It is bounded by the quality of extracted evidence.',
+    '  This is bounded by the quality of extracted evidence.',
     '  A great opportunity backed only by founder assumptions must score low here.',
-    '  Drivers: strength of extracted evidence records, breadth of validated categories,',
-    '    presence of external signals (customer conversations, paying customers, revenue data).',
-    '  Core question: "How much should I trust this assessment given the evidence?"',
+    '  Anchor: use the computedScore in the PRE-COMPUTED CONFIDENCE BREAKDOWN section.',
+    '  You may adjust by up to ±15 points using your synthesis judgment.',
+    '  If you deviate by more than 10 points from computedScore, set adjustmentRationale in confidenceBreakdown.',
     '',
     'SCORE INDEPENDENCE — THIS IS CRITICAL:',
     '  A low confidenceScore MUST NOT automatically reduce opportunityScore.',
     '  opportunityScore evaluates the startup\'s potential if the thesis is correct.',
     '  confidenceScore evaluates how much evidence supports that thesis.',
-    '  Both scores carry real independent information. Do not collapse them into one signal.',
     '',
     '  Valid and expected combinations:',
     '    opportunityScore: 90, confidenceScore: 20  — breakthrough idea, entirely unvalidated',
     '    opportunityScore: 35, confidenceScore: 85  — well-validated but fundamentally weak opportunity',
     '    opportunityScore: 70, confidenceScore: 70  — solid opportunity with good evidence',
     '',
-    'CONFIDENCE CALIBRATION (soft guidance — apply judgment, not hard arithmetic):',
-    '  All evidence is founder assumption (strength ≤ 1)  → confidence generally should not exceed 25',
-    '  Strongest evidence is anecdotal (strength 2)       → confidence generally should not exceed 40',
-    '  Strongest evidence is customer conversations (3)   → confidence generally should not exceed 60',
-    '  Strongest evidence is structured interviews (4)    → confidence generally should not exceed 78',
-    '  Paying customers present (strength 5)              → confidence can reach 90+',
-    '  Usage or revenue data (strength 6)                 → high confidence is warranted',
+    '=== SCORE BREAKDOWN (v2.0 REQUIRED) ===',
     '',
-    '  If required categories (problem/customer/solution) are all assumption or anecdotal,',
-    '  consider reducing confidence by a further ~15 points — core thesis is untested.',
+    'You must output scoreBreakdown with exactly these 5 sub-dimensions:',
     '',
-    '  Use the Evidence Quality Summary at the bottom of the user message as your',
-    '  primary calibration anchor. It is derived from raw evidence records, not interpretations.',
+    '  problemStrength      weight: 25  — severity and urgency of the problem',
+    '  customerClarity      weight: 25  — specificity and reachability of target customer',
+    '  marketPotential      weight: 20  — addressable market size and growth trajectory',
+    '  competitiveAdvantage weight: 15  — moat, differentiation, and defensibility',
+    '  founderFit           weight: 15  — domain expertise, network, and execution capability',
+    '',
+    'ARITHMETIC CONSTRAINT — CRITICAL:',
+    '  opportunityScore MUST equal the weighted sum of scoreBreakdown dimensions (rounded to integer).',
+    '  Formula: round( (problemStrength.score × 0.25) + (customerClarity.score × 0.25)',
+    '                + (marketPotential.score × 0.20) + (competitiveAdvantage.score × 0.15)',
+    '                + (founderFit.score × 0.15) )',
+    '  Verify this before outputting. Adjust sub-dimension scores if needed to match.',
+    '',
+    'For each sub-dimension, assign:',
+    '  score:     0-100 (your judgment for this dimension)',
+    '  weight:    the fixed weight above (25/25/20/15/15)',
+    '  rationale: 1-2 sentences explaining why this dimension scored this way',
+    '  tier:      the assessmentTier of the primary category driving this dimension:',
+    '             "validated" | "assumption_based" | "gap" | "unknown"',
+    '',
+    '=== CONFIDENCE BREAKDOWN (v2.0 REQUIRED) ===',
+    '',
+    'Output confidenceBreakdown using the pre-computed data from the user message:',
+    '  categories:        copy the full per-category array from PRE-COMPUTED CONFIDENCE BREAKDOWN',
+    '  strongCategories:  copy from pre-computed data',
+    '  weakCategories:    copy from pre-computed data',
+    '  missingCategories: copy from pre-computed data',
+    '  computedScore:     copy the computedScore from pre-computed data',
+    '  adjustmentRationale: include ONLY if your confidenceScore deviates > 10 pts from computedScore',
+    '',
+    '=== VALIDATION GAP SUMMARY (v2.0 REQUIRED) ===',
+    '',
+    'Output validationGapSummary verbatim from the PRE-COMPUTED VALIDATION GAPS section.',
+    'Do not rewrite or omit any gaps. Copy gaps[], evidenceStrength, and overallGapRisk exactly.',
     '',
     '=== SUB-DIMENSION SCORING ===',
     '',
@@ -288,22 +277,25 @@ export function buildSystemPrompt(): string {
     '',
     '=== OUTPUT ===',
     'Return a single JSON object matching the provided schema. All fields required.',
-    'No markdown fencing. No prose outside the JSON.',
+    'Schema version must be "2.0". No markdown fencing. No prose outside the JSON.',
     'executiveSummary: 2-4 sentences covering the core opportunity, biggest risk, and recommended action.',
   ].join('\n')
 }
 
 // ── buildUserMessage ──────────────────────────────────────────────────────────
-// Character budgets are enforced on every string field via truncate().
-// Evidence records are expected pre-trimmed by trimEvidenceRecords().
 export function buildUserMessage(params: {
-  startup:         Startup
-  founderMemory:   FounderMemory
-  understanding:   FounderUnderstanding
-  evidenceRecords: EvidenceRecordRow[]
-  latestSummary?:  SessionSummary
+  startup:              Startup
+  founderMemory:        FounderMemory
+  understanding:        FounderUnderstanding
+  evidenceRecords:      EvidenceRecordRow[]
+  preComputedConfidence: ConfidenceBreakdown
+  preComputedGaps:      ValidationGapSummary
+  latestSummary?:       SessionSummary
 }): string {
-  const { startup, founderMemory, understanding, evidenceRecords, latestSummary } = params
+  const {
+    startup, founderMemory, understanding, evidenceRecords,
+    preComputedConfidence, preComputedGaps, latestSummary,
+  } = params
   const lines: string[] = []
 
   // ── Startup context ───────────────────────────────────────────────────────
@@ -371,7 +363,6 @@ export function buildUserMessage(params: {
   lines.push('')
 
   // ── Session summary (supplemental) ───────────────────────────────────────
-  // Carries context that may have been compressed out of the memory pipeline.
   if (latestSummary) {
     lines.push('=== SESSION SUMMARY (supplemental context) ===')
 
@@ -410,8 +401,8 @@ export function buildUserMessage(params: {
   lines.push('')
 
   for (const cat of UNDERSTANDING_CATEGORIES as readonly UnderstandingCategory[]) {
-    const state    = understanding.categories[cat]
-    const display  = CATEGORY_DISPLAY[cat]
+    const state   = understanding.categories[cat]
+    const display = CATEGORY_DISPLAY[cat]
     const required = display.required ? ' [REQUIRED]' : ''
     const gapTag   = state.validationStatus === 'explicitly_unvalidated'
       ? ' *** VALIDATION GAP ***'
@@ -431,7 +422,7 @@ export function buildUserMessage(params: {
 
   lines.push('')
 
-  // ── Validation gaps ───────────────────────────────────────────────────────
+  // ── Validation gaps from understanding ───────────────────────────────────
   const validationGaps = understanding.validationGaps ?? []
   if (validationGaps.length > 0) {
     lines.push('=== VALIDATION GAPS (founder confirmed no external evidence) ===')
@@ -460,10 +451,15 @@ export function buildUserMessage(params: {
   lines.push(...renderEvidenceSection(evidenceRecords))
 
   // ── Evidence quality summary (confidence calibration anchor) ─────────────
-  // Derived from raw EvidenceRecordRow[] — not the interpretation layer.
   lines.push(...buildEvidenceQualitySummary(evidenceRecords))
 
-  lines.push('Now produce the Opportunity Assessment JSON.')
+  // ── Pre-computed confidence breakdown (v2.0 anchor) ──────────────────────
+  lines.push(...renderConfidenceBreakdownPromptBlock(preComputedConfidence))
+
+  // ── Pre-computed validation gaps (v2.0 — output verbatim) ────────────────
+  lines.push(...renderValidationGapsPromptBlock(preComputedGaps))
+
+  lines.push('Now produce the Opportunity Assessment JSON (schema version "2.0").')
 
   return lines.join('\n')
 }
