@@ -1,6 +1,6 @@
 import { check, decimal, integer, jsonb, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
-import { aiPurposeEnum, generationJobStatusEnum, generationJobTypeEnum } from './enums.ts'
+import { aiProviderEnum, aiPurposeEnum, generationJobStatusEnum, generationJobTypeEnum } from './enums.ts'
 import { startups } from './startups.ts'
 
 export const generationJobs = pgTable('generation_jobs', {
@@ -10,6 +10,7 @@ export const generationJobs = pgTable('generation_jobs', {
   parentJobId: uuid('parent_job_id'),
   type: generationJobTypeEnum('type').notNull(),
   status: generationJobStatusEnum('status').notNull().default('pending'),
+  provider: aiProviderEnum('provider').notNull().default('openai'),
   artifactId: uuid('artifact_id'),
   artifactType: text('artifact_type'),
   promptVersion: text('prompt_version'),

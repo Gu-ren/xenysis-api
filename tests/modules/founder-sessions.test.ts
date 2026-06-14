@@ -198,6 +198,12 @@ describe('POST /api/v1/startups/:id/sessions/:sessionId/answers', () => {
     mockStartupFindFirst.mockResolvedValue(makeStartup())
     mockSessionFindFirst.mockResolvedValue(makeSession({ status: 'active' }))
     const answer = makeAnswer()
+    // Route counts existing answers via db.select before inserting.
+    mockAnswerSelect.mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([{ answerCount: 0 }]),
+      }),
+    })
     mockInsert.mockReturnValue({
       values: vi.fn().mockReturnValue({
         returning: vi.fn().mockResolvedValue([answer]),
