@@ -42,7 +42,19 @@ export const aiUsageLog = pgTable('ai_usage_log', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
+export const activityLog = pgTable('activity_log', {
+  id:          uuid('id').primaryKey().defaultRandom(),
+  userId:      uuid('user_id').notNull(),
+  startupId:   uuid('startup_id').references(() => startups.id),
+  type:        text('type').notNull(),
+  description: text('description').notNull(),
+  meta:        jsonb('meta'),
+  createdAt:   timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
 export type GenerationJob = typeof generationJobs.$inferSelect
 export type NewGenerationJob = typeof generationJobs.$inferInsert
 export type AiUsageLog = typeof aiUsageLog.$inferSelect
 export type NewAiUsageLog = typeof aiUsageLog.$inferInsert
+export type ActivityLog = typeof activityLog.$inferSelect
+export type NewActivityLog = typeof activityLog.$inferInsert

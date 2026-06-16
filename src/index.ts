@@ -43,14 +43,6 @@ v1.route('/startups', startupsRouter)
 v1.route('/startups', founderSessionsRouter)
 v1.route('/startups', opportunityRouter)
 
-// TODO(sprint-4): v1.route('/startups', blueprintRouter)
-// TODO(sprint-4): v1.route('/startups', blueprintRouter)
-// TODO(sprint-5): v1.route('/startups', workspaceRouter)
-// TODO(sprint-3): v1.route('/startups', generationRouter)
-// TODO(sprint-5): v1.route('/startups', deployRouter)
-// TODO(sprint-2): v1.route('/startups', activityRouter)
-// TODO(sprint-3): v1.route('/usage', usageRouter)
-
 
 app.route('/api/v1', v1)
 
