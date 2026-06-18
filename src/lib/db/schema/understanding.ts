@@ -42,6 +42,13 @@ export const founderUnderstanding = pgTable(
     // AND overall >= 75. Supporting categories generate warnings but do not block.
     isComplete: boolean('is_complete').notNull().default(false),
 
+    // v2.2 PR2: sticky marketplace signal — true once set, never reverts.
+    // Normalized here for filtering/analytics; canonical value lives in the understanding JSONB.
+    marketplaceDetected: boolean('marketplace_detected').notNull().default(false),
+
+    // v2.2 PR3: supply-side confidence for marketplace sessions (always 0 for non-marketplace).
+    supplySideConfidence: integer('supply_side_confidence').notNull().default(0),
+
     // Category with the highest gap priority: (100 - confidence) × businessImportance.
     weakestCategory: text('weakest_category'),
 
@@ -64,6 +71,7 @@ export const founderUnderstanding = pgTable(
     check('founder_fit_confidence_range',  sql`${t.founderFitConfidence}  BETWEEN 0 AND 100`),
     check('overall_confidence_range',      sql`${t.overallConfidence}     BETWEEN 0 AND 100`),
     check('overall_evidence_strength_range', sql`${t.overallEvidenceStrength} BETWEEN 1 AND 6`),
+    check('supply_side_confidence_range',    sql`${t.supplySideConfidence}     BETWEEN 0 AND 100`),
   ],
 )
 

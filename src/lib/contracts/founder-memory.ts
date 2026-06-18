@@ -14,6 +14,7 @@ const CategoryConfidenceSchema = z.object({
   competition:  z.number().int().min(0).max(100),
   risks:        z.number().int().min(0).max(100),
   founder_fit:  z.number().int().min(0).max(100),
+  supply_side:  z.number().int().min(0).max(100).default(0),  // v2.2 PR3
 })
 export type CategoryConfidence = z.infer<typeof CategoryConfidenceSchema>
 
@@ -27,6 +28,7 @@ const CategoryEvidenceSchema = z.object({
   competition:  z.array(z.string().max(200)).max(3),
   risks:        z.array(z.string().max(200)).max(3),
   founder_fit:  z.array(z.string().max(200)).max(3),
+  supply_side:  z.array(z.string().max(200)).max(3).default([]),  // v2.2 PR3
 })
 export type CategoryEvidence = z.infer<typeof CategoryEvidenceSchema>
 
@@ -46,6 +48,7 @@ const CategoryEvidenceStrengthSchema = z.object({
   competition:  z.number().int().min(0).max(6).catch(1),
   risks:        z.number().int().min(0).max(6).catch(1),
   founder_fit:  z.number().int().min(0).max(6).catch(1),
+  supply_side:  z.number().int().min(0).max(6).catch(1),  // v2.2 PR3
 })
 export type CategoryEvidenceStrength = z.infer<typeof CategoryEvidenceStrengthSchema>
 
@@ -62,6 +65,7 @@ const CategoryAbsenceSignalsSchema = z.object({
   competition: AbsenceSignalSchema.default('none'),
   risks:       AbsenceSignalSchema.default('none'),
   founder_fit: AbsenceSignalSchema.default('none'),
+  supply_side: AbsenceSignalSchema.default('none'),  // v2.2 PR3
 })
 export type CategoryAbsenceSignals = z.infer<typeof CategoryAbsenceSignalsSchema>
 
@@ -108,6 +112,7 @@ export const FounderMemorySchema = z.object({
     competition: 0,
     risks:       0,
     founder_fit: 0,
+    supply_side: 0,
   }),
 
   // Per-category evidence statements — cumulative (append-unique across turns).
@@ -120,6 +125,7 @@ export const FounderMemorySchema = z.object({
     competition: [],
     risks:       [],
     founder_fit: [],
+    supply_side: [],
   }),
 
   // Revision 3: evidence strength per category — replace-with-latest (living assessment).
@@ -132,6 +138,7 @@ export const FounderMemorySchema = z.object({
     competition: 1,
     risks:       1,
     founder_fit: 1,
+    supply_side: 1,
   }),
 
   // This revision: per-turn absence signal per category — replace-with-latest.
@@ -145,12 +152,20 @@ export const FounderMemorySchema = z.object({
     competition: 'none',
     risks:       'none',
     founder_fit: 'none',
+    supply_side: 'none',
   }),
 
   // v2.1 F3: replace-with-latest per turn. True only for genuine two-sided marketplaces
   // or dual-segment businesses with meaningfully different pricing/service models.
   // Once true in FounderUnderstanding, it stays true (stickiness is in the engine, not here).
   multi_icp_detected: z.boolean().default(false),
+
+  // v2.2 PR2: replace-with-latest per turn. True for genuine two-sided platforms where
+  // distinct supply-side participants create value consumed by distinct demand-side participants
+  // (Airbnb/hosts+guests, Uber/drivers+riders, Etsy/sellers+buyers).
+  // More specific than multi_icp_detected — gates supply_side discovery in PR3.
+  // Stickiness enforced in the engine, not here.
+  marketplace_detected: z.boolean().default(false),
 
   // v2.1 F4: replace-with-latest per turn. True on the specific turn where a genuine
   // mid-session pivot is detected. Does NOT trigger confidence merge bypass (v2.2).
@@ -290,6 +305,11 @@ export function mergeFounderMemory(
   // understanding engine, not here — memory always reflects the current turn's LLM output.
   if (typeof extracted.multi_icp_detected === 'boolean') {
     merged.multi_icp_detected = extracted.multi_icp_detected
+  }
+
+  // v2.2 PR2: replace-with-latest. Stickiness enforced in the engine.
+  if (typeof extracted.marketplace_detected === 'boolean') {
+    merged.marketplace_detected = extracted.marketplace_detected
   }
 
   // v2.1 F4: replace-with-latest per turn. True only on the turn the pivot is detected.

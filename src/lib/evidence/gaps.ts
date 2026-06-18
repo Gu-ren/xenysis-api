@@ -124,6 +124,9 @@ export function computeValidationGaps(understanding: FounderUnderstanding): Vali
   const gaps: ValidationGap[] = []
 
   for (const cat of UNDERSTANDING_CATEGORIES) {
+    // supply_side is a Founder Session category not represented in the OA schema.
+    if (cat === 'supply_side') continue
+
     const state = understanding.categories[cat]
     const tier  = state.assessmentTier
 

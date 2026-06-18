@@ -50,6 +50,9 @@ export function computeEvidenceConfidence(understanding: FounderUnderstanding): 
   let totalWeight         = 0
 
   for (const cat of UNDERSTANDING_CATEGORIES) {
+    // supply_side is a Founder Session category not represented in the OA schema.
+    if (cat === 'supply_side') continue
+
     const state    = understanding.categories[cat]
     const strength = (state.evidenceStrength ?? 1) as EvidenceStrength
     const ceiling  = STRENGTH_CEILINGS[strength]
@@ -80,9 +83,9 @@ export function computeEvidenceConfidence(understanding: FounderUnderstanding): 
 
   const computedScore = Math.round(weightedQualitySum / totalWeight)
 
-  const strongCategories:  UnderstandingCategory[] = []
-  const weakCategories:    UnderstandingCategory[] = []
-  const missingCategories: UnderstandingCategory[] = []
+  const strongCategories:  CategoryEvidenceQuality['category'][] = []
+  const weakCategories:    CategoryEvidenceQuality['category'][] = []
+  const missingCategories: CategoryEvidenceQuality['category'][] = []
 
   for (const result of categoryResults) {
     if (result.qualityScore >= 60)      strongCategories.push(result.category)

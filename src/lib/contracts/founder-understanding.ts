@@ -52,6 +52,7 @@ export const UNDERSTANDING_CATEGORIES = [
   'competition',
   'risks',
   'founder_fit',      // Revision 2: domain expertise, customer access, execution capability
+  'supply_side',      // v2.2 PR3: only active for marketplace sessions (marketplaceDetected=true)
 ] as const
 
 export type UnderstandingCategory = (typeof UNDERSTANDING_CATEGORIES)[number]
@@ -70,6 +71,7 @@ export const SUPPORTING_CATEGORIES: readonly UnderstandingCategory[] = [
   'competition',
   'risks',
   'founder_fit',
+  'supply_side',      // v2.2 PR3: promoted to effective-required when marketplaceDetected=true
 ] as const
 
 // Business importance weights for priority formula: (100 - confidence) × importance.
@@ -79,13 +81,17 @@ export const CATEGORY_IMPORTANCE: Record<UnderstandingCategory, number> = {
   competition:  10,
   market:        9,
   solution:      9,
+  supply_side:   9,   // v2.2 PR3: only included in weight sum for marketplace sessions
   pricing:       8,
   risks:         8,
   founder_fit:   8,   // Revision 2
 }
 
-// Total weight — updated for 8 categories (was 64, now 72).
-const TOTAL_WEIGHT = Object.values(CATEGORY_IMPORTANCE).reduce((a, b) => a + b, 0) // 72
+// Total weight without supply_side (non-marketplace sessions): 72.
+// Total weight with supply_side (marketplace sessions): 81.
+// computeOverallConfidence selects the appropriate denominator based on marketplaceDetected.
+export const TOTAL_WEIGHT_BASE        = 72  // 8 categories, excluding supply_side
+export const TOTAL_WEIGHT_MARKETPLACE = 81  // 9 categories, including supply_side
 
 // Confidence thresholds for status derivation.
 const THRESHOLD_PARTIAL = 30    // below this → missing
@@ -115,6 +121,27 @@ export type BlueprintMode = z.infer<typeof BlueprintModeSchema>
 // Completion thresholds.
 export const THRESHOLD_COMPLETE   = 80   // building / revenue stage (and evidence floor)
 export const THRESHOLD_HYPOTHESIS = 60   // idea stage only
+
+// Per-strength confidence ceilings applied only inside checkCompletion.
+// They are not stored, not shown in the UI, and do not affect the OA layer.
+// The design intent: a founder with strength-1 (pure assumption) cannot cross either
+// threshold regardless of how coherent their narrative is. A founder with strength-3
+// (customer conversations) can just reach the building-stage threshold of 80.
+//
+//   strength 1 → ceiling 50  (below 60 and 80 — assumption-only sessions never complete)
+//   strength 2 → ceiling 65  (above 60, below 80 — anecdotal can close idea-stage only)
+//   strength 3 → ceiling 83  (above 80 — conversations can close building-stage)
+//   strength 4 → ceiling 92
+//   strength 5 → ceiling 97
+//   strength 6 → ceiling 100
+export const COMPLETION_EVIDENCE_CEILINGS: Record<EvidenceStrength, number> = {
+  1: 50,
+  2: 65,
+  3: 83,
+  4: 92,
+  5: 97,
+  6: 100,
+}
 
 // ── Evidence strength ─────────────────────────────────────────────────────────
 // Revision 3: tracks the quality of evidence behind a confidence score.
@@ -160,7 +187,7 @@ export type CategoryState = z.infer<typeof CategoryStateSchema>
 
 // Warning attached to a weak supporting category on a complete session.
 export const CategoryWarningSchema = z.object({
-  category:        z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit']),
+  category:        z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side']),
   confidence:      z.number().int().min(0).max(100),
   evidenceStrength: EvidenceStrengthSchema,
   message:         z.string(),
@@ -179,6 +206,7 @@ export const FounderUnderstandingSchema = z.object({
     competition:  CategoryStateSchema,
     risks:        CategoryStateSchema,
     founder_fit:  CategoryStateSchema,   // Revision 2
+    supply_side:  CategoryStateSchema,   // v2.2 PR3: active for marketplace sessions only
   }),
 
   overallConfidence: z.number().int().min(0).max(100),
@@ -187,7 +215,7 @@ export const FounderUnderstandingSchema = z.object({
   // The category with the highest gap priority. Null only before first exchange.
   weakestCategory: z.enum([
     'problem', 'customer', 'solution', 'market', 'pricing',
-    'competition', 'risks', 'founder_fit',
+    'competition', 'risks', 'founder_fit', 'supply_side',
   ]).nullable(),
 
   // Revision 4: warnings for weak supporting categories on a complete session.
@@ -205,7 +233,7 @@ export const FounderUnderstandingSchema = z.object({
   // Categories the founder has explicitly confirmed have no external evidence yet.
   // Derived from per-category validationStatus === 'explicitly_unvalidated'.
   validationGaps: z.array(
-    z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit']),
+    z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side']),
   ).default([]),
 
   // Session-level questioning orientation — shifts to gap_identification when all categories
@@ -216,12 +244,19 @@ export const FounderUnderstandingSchema = z.object({
   founderStage:     FounderStageSchema.default('building'),
   blueprintMode:    BlueprintModeSchema.default('validated'),
   gapsInBlueprint:  z.array(
-    z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit']),
+    z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side']),
   ).default([]),
 
   // v2.1 F3: sticky — once true, stays true for the session lifetime.
   // Suppresses customer from the blocked-topics list and changes the focus instruction.
   multiIcpDetected: z.boolean().default(false),
+
+  // v2.2 PR2: sticky marketplace detection — separate from multiIcpDetected.
+  // True for genuine two-sided platforms where supply-side participants create value
+  // and demand-side participants consume it (Airbnb, Uber, Etsy patterns).
+  // Gates supply_side discovery in PR3. Set by session-init heuristic OR LLM extraction.
+  // Once true, never reverts for the session lifetime.
+  marketplaceDetected: z.boolean().default(false),
 
   // v2.1 F4: per-turn — true only on the turn a pivot is detected.
   // Does NOT bypass confidence merge (v2.2). Used for chat acknowledgment + analytics.
@@ -234,20 +269,38 @@ export type FounderUnderstanding = z.infer<typeof FounderUnderstandingSchema>
 
 // ── Pure computation ──────────────────────────────────────────────────────────
 
+// v2.2 PR3: supply_side is required for marketplace sessions, invisible for all others.
+// This is the single source of truth for which categories block completion.
+export function getEffectiveRequiredCategories(
+  marketplaceDetected: boolean,
+): readonly UnderstandingCategory[] {
+  return marketplaceDetected
+    ? [...REQUIRED_CATEGORIES, 'supply_side' as UnderstandingCategory]
+    : REQUIRED_CATEGORIES
+}
+
 export function confidenceToStatus(confidence: number): CategoryStatus {
   if (confidence >= THRESHOLD_COMPLETE) return 'complete'
   if (confidence >= THRESHOLD_PARTIAL)  return 'partial'
   return 'missing'
 }
 
-// Weighted average using CATEGORY_IMPORTANCE across all 8 categories.
+// Weighted average using CATEGORY_IMPORTANCE.
+// supply_side is excluded for non-marketplace sessions (keeping the denominator at 72)
+// so a 0 supply_side score does not drag down the displayed confidence for founders
+// who are not building a marketplace.
 export function computeOverallConfidence(
   categoryConfidence: Record<UnderstandingCategory, number>,
+  marketplaceDetected: boolean = false,
 ): number {
-  const weightedSum = UNDERSTANDING_CATEGORIES.reduce((sum, cat) => {
+  const cats        = marketplaceDetected
+    ? UNDERSTANDING_CATEGORIES
+    : UNDERSTANDING_CATEGORIES.filter((c) => c !== 'supply_side')
+  const totalWeight = marketplaceDetected ? TOTAL_WEIGHT_MARKETPLACE : TOTAL_WEIGHT_BASE
+  const weightedSum = cats.reduce((sum, cat) => {
     return sum + (categoryConfidence[cat] ?? 0) * CATEGORY_IMPORTANCE[cat]
   }, 0)
-  return Math.round(weightedSum / TOTAL_WEIGHT)
+  return Math.round(weightedSum / totalWeight)
 }
 
 // Priority formula: (100 - confidence) × importance.
@@ -271,11 +324,16 @@ export function detectWeakestCategory(
   focusHistory: string[] = [],
   saturationCounts: Partial<Record<UnderstandingCategory, number>> = {},
   multiIcpDetected: boolean = false,
+  // v2.2 PR3: supply_side is invisible to non-marketplace sessions — never selected as focus.
+  marketplaceDetected: boolean = false,
 ): UnderstandingCategory {
   let maxPriority = -1
   let weakest: UnderstandingCategory = 'competition'
 
   for (const cat of UNDERSTANDING_CATEGORIES) {
+    // supply_side is invisible to non-marketplace sessions.
+    if (cat === 'supply_side' && !marketplaceDetected) continue
+
     const basePriority = computeCategoryPriority(cat, categoryConfidence[cat] ?? 0)
     const recentCount  = Math.min(focusHistory.filter((h) => h === cat).length, 3)
     const coolMult     = COOLING_MULTIPLIERS[recentCount] ?? 1.0
@@ -300,28 +358,41 @@ export function detectWeakestCategory(
 // v2.1: 'idea'-stage founders use THRESHOLD_HYPOTHESIS (60) unless the evidence floor fires.
 // Evidence floor: if maxEvidenceStrength >= 4 (customer interviews or better), always use
 // THRESHOLD_COMPLETE regardless of declared stage — prevents gaming the idea threshold.
+// v2.2: each required category's raw confidence is capped by COMPLETION_EVIDENCE_CEILINGS
+// before being compared to the threshold. A founder with only strength-1 (assumption) on a
+// required category cannot reach either threshold regardless of extracted confidence score.
 export function checkCompletion(
   categoryConfidence: Record<UnderstandingCategory, number>,
   _overallConfidence: number,
   founderStage: FounderStage = 'building',
   maxEvidenceStrength: EvidenceStrength = 1,
+  categoryStrength?: Partial<Record<UnderstandingCategory, EvidenceStrength>>,
+  // v2.2 PR3: supply_side joins the required set when marketplaceDetected=true.
+  marketplaceDetected: boolean = false,
 ): boolean {
+  const effectiveRequired = getEffectiveRequiredCategories(marketplaceDetected)
   const stageThreshold = founderStage === 'idea' ? THRESHOLD_HYPOTHESIS : THRESHOLD_COMPLETE
   const threshold = maxEvidenceStrength >= 4 ? THRESHOLD_COMPLETE : stageThreshold
-  return REQUIRED_CATEGORIES.every(
-    (cat) => (categoryConfidence[cat] ?? 0) >= threshold,
-  )
+  return effectiveRequired.every((cat) => {
+    const raw      = categoryConfidence[cat] ?? 0
+    const strength = (categoryStrength?.[cat] ?? 1) as EvidenceStrength
+    const ceiling  = COMPLETION_EVIDENCE_CEILINGS[strength] ?? 50
+    return Math.min(raw, ceiling) >= threshold
+  })
 }
 
 // Produce warnings for supporting categories below SUPPORTING_WARNING_THRESHOLD.
 // Used to populate the Founder Report after session completion.
+// supply_side is only included when marketplaceDetected=true — invisible otherwise.
 export function buildCompletionWarnings(
   categoryConfidence: Record<UnderstandingCategory, number>,
   categoryStrength:   Record<UnderstandingCategory, EvidenceStrength>,
+  marketplaceDetected: boolean = false,
 ): CategoryWarning[] {
   const warnings: CategoryWarning[] = []
 
   for (const cat of SUPPORTING_CATEGORIES) {
+    if (cat === 'supply_side' && !marketplaceDetected) continue
     const confidence = categoryConfidence[cat] ?? 0
     if (confidence < SUPPORTING_WARNING_THRESHOLD) {
       warnings.push({
@@ -391,6 +462,8 @@ const QUESTIONING_MODE_SUPPORTING_THRESHOLD = 60
 
 export function detectQuestioningMode(
   categories: FounderUnderstanding['categories'],
+  // v2.2 PR3: supply_side is treated as automatically done for non-marketplace sessions.
+  marketplaceDetected: boolean = false,
 ): QuestioningMode {
   const requiredMet = REQUIRED_CATEGORIES.every(
     (cat) => (categories[cat]?.confidence ?? 0) >= QUESTIONING_MODE_REQUIRED_THRESHOLD,
@@ -398,6 +471,7 @@ export function detectQuestioningMode(
   if (!requiredMet) return 'discovery'
 
   const supportingDone = SUPPORTING_CATEGORIES.every((cat) => {
+    if (cat === 'supply_side' && !marketplaceDetected) return true
     const state = categories[cat]
     return (
       (state?.confidence ?? 0) >= QUESTIONING_MODE_SUPPORTING_THRESHOLD ||
@@ -430,9 +504,11 @@ export function buildUnderstanding(params: {
   founderStage?:        FounderStage
   maxEvidenceStrength?: EvidenceStrength
   // v2.1 F3+F4:
-  multiIcpDetected?:   boolean
-  pivotDetected?:      boolean
-  existingPivotCount?: number
+  multiIcpDetected?:    boolean
+  pivotDetected?:       boolean
+  existingPivotCount?:  number
+  // v2.2 PR2:
+  marketplaceDetected?: boolean
 }): FounderUnderstanding {
   const {
     categoryConfidence,
@@ -450,13 +526,14 @@ export function buildUnderstanding(params: {
     multiIcpDetected    = false,
     pivotDetected       = false,
     existingPivotCount  = 0,
+    marketplaceDetected = false,
   } = params
 
   // The category at focusHistory[0] was the weakest last turn — used for saturation delta check.
   const lastFocusCat = (focusHistory[0] ?? null) as UnderstandingCategory | null
 
-  const overallConfidence = computeOverallConfidence(categoryConfidence)
-  const isComplete        = checkCompletion(categoryConfidence, overallConfidence, founderStage, maxEvidenceStrength)
+  const overallConfidence = computeOverallConfidence(categoryConfidence, marketplaceDetected)
+  const isComplete        = checkCompletion(categoryConfidence, overallConfidence, founderStage, maxEvidenceStrength, categoryStrength, marketplaceDetected)
 
   // Evidence accumulates across turns (append unique, cap at 5).
   const mergeEvidence = (existing: string[], incoming: string[]): string[] => {
@@ -512,15 +589,15 @@ export function buildUnderstanding(params: {
     }),
   ) as FounderUnderstanding['categories']
 
-  const weakestCategory = detectWeakestCategory(categoryConfidence, focusHistory, saturationCountsForDetect, multiIcpDetected)
+  const weakestCategory = detectWeakestCategory(categoryConfidence, focusHistory, saturationCountsForDetect, multiIcpDetected, marketplaceDetected)
   const warnings        = isComplete
-    ? buildCompletionWarnings(categoryConfidence, categoryStrength)
+    ? buildCompletionWarnings(categoryConfidence, categoryStrength, marketplaceDetected)
     : []
 
   const validationGaps = UNDERSTANDING_CATEGORIES.filter(
     (cat) => categories[cat].validationStatus === 'explicitly_unvalidated',
   )
-  const questioningMode = detectQuestioningMode(categories)
+  const questioningMode = detectQuestioningMode(categories, marketplaceDetected)
 
   // v2.1 F4: pivot accumulator increments each turn a pivot is detected.
   const pivotCount = existingPivotCount + (pivotDetected ? 1 : 0)
@@ -556,6 +633,7 @@ export function buildUnderstanding(params: {
     blueprintMode,
     gapsInBlueprint,
     multiIcpDetected,
+    marketplaceDetected,
     pivotDetected,
     pivotCount,
   }
@@ -587,6 +665,7 @@ export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
     competition: { ...EMPTY_CATEGORY_STATE },
     risks:       { ...EMPTY_CATEGORY_STATE },
     founder_fit: { ...EMPTY_CATEGORY_STATE },
+    supply_side: { ...EMPTY_CATEGORY_STATE },
   },
   overallConfidence: 0,
   isComplete:        false,
@@ -598,22 +677,25 @@ export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
   founderStage:      'building',
   blueprintMode:     'validated',
   gapsInBlueprint:   [],
-  multiIcpDetected:  false,
-  pivotDetected:     false,
-  pivotCount:        0,
+  multiIcpDetected:    false,
+  marketplaceDetected: false,
+  pivotDetected:       false,
+  pivotCount:          0,
 }
 
 // ── UI progress model ─────────────────────────────────────────────────────────
 
 export const CATEGORY_DISPLAY: Record<UnderstandingCategory, { label: string; description: string; required: boolean }> = {
-  problem:     { label: 'Problem Identified',        description: 'Core pain or inefficiency being solved',          required: true  },
-  customer:    { label: 'Customer Identified',       description: 'Primary buyer persona and segment',               required: true  },
-  solution:    { label: 'Solution Understood',       description: 'Product approach and value proposition',          required: true  },
-  market:      { label: 'Market Understood',         description: 'TAM, SAM, SOM and growth signals',               required: false },
-  pricing:     { label: 'Pricing Identified',        description: 'Revenue model and pricing strategy',              required: false },
-  competition: { label: 'Competition Validated',     description: 'Competitive landscape and differentiation',       required: false },
-  risks:       { label: 'Risks Clarified',           description: 'Key assumptions and execution risks',             required: false },
-  founder_fit: { label: 'Founder Fit Assessed',      description: 'Domain expertise, access, and execution ability', required: false },
+  problem:     { label: 'Problem Identified',        description: 'Core pain or inefficiency being solved',                        required: true  },
+  customer:    { label: 'Customer Identified',       description: 'Primary buyer persona and segment',                             required: true  },
+  solution:    { label: 'Solution Understood',       description: 'Product approach and value proposition',                        required: true  },
+  market:      { label: 'Market Understood',         description: 'TAM, SAM, SOM and growth signals',                             required: false },
+  pricing:     { label: 'Pricing Identified',        description: 'Revenue model and pricing strategy',                            required: false },
+  competition: { label: 'Competition Validated',     description: 'Competitive landscape and differentiation',                     required: false },
+  risks:       { label: 'Risks Clarified',           description: 'Key assumptions and execution risks',                           required: false },
+  founder_fit: { label: 'Founder Fit Assessed',      description: 'Domain expertise, access, and execution ability',               required: false },
+  // v2.2 PR3: required=true for marketplace sessions (gated by marketplaceDetected at runtime)
+  supply_side: { label: 'Supply Side Understood',    description: 'Provider recruitment, onboarding, quality, and retention',      required: false },
 }
 
 // Completion signal shape returned by GET /understanding and included in SSE done event.
@@ -622,7 +704,7 @@ export const CompletionSignalSchema = z.object({
   overallConfidence: z.number().int().min(0).max(100),
   weakestCategory:   z.enum([
     'problem', 'customer', 'solution', 'market', 'pricing',
-    'competition', 'risks', 'founder_fit',
+    'competition', 'risks', 'founder_fit', 'supply_side',
   ]).nullable(),
   warnings:          z.array(CategoryWarningSchema).default([]),
   reason:            z.string().optional(),

@@ -37,6 +37,29 @@ import type { HonoEnv } from '../../types/hono.ts'
 const MAX_SESSION_ANSWERS = Number(process.env.MAX_SESSION_ANSWERS ?? 100)
 const MAX_CHAT_MESSAGES_PER_SESSION = Number(process.env.MAX_CHAT_MESSAGES_PER_SESSION ?? 50)
 
+// ── v2.2 PR2: Session-init marketplace heuristic ──────────────────────────────
+// Conservative keyword/pattern check on the founder's idea text.
+// False negatives are acceptable — the LLM extraction catches cases the heuristic misses
+// and the sticky flag in the engine propagates the signal once either source fires.
+// False positives are tolerable (extra context in the prompt) but kept low by requiring
+// explicit platform-structure terms rather than generic "marketplace" mentions.
+function classifyMarketplaceFromIdea(idea: string): boolean {
+  const text = idea.toLowerCase()
+  return (
+    /\bmarketplace\b/.test(text)                              ||
+    /\btwo[- ]sided\b/.test(text)                             ||
+    /\bdual[- ]sided\b/.test(text)                            ||
+    /\b(buyers?\s+and\s+sellers?|sellers?\s+and\s+buyers?)\b/.test(text) ||
+    /\b(hosts?\s+and\s+guests?|guests?\s+and\s+hosts?)\b/.test(text)     ||
+    /\b(drivers?\s+and\s+riders?|riders?\s+and\s+drivers?)\b/.test(text) ||
+    /\bsupply[- ]side\b/.test(text)                           ||
+    /\bplatform\b.*\bconnect\w*\b/.test(text)                  ||
+    /\bconnect\w*\b.*\bplatform\b/.test(text)                  ||
+    /\bplatform\b.*\b(match(ing)?|link(ing)?)\b/.test(text)    ||
+    /\b(match(ing)?|link(ing)?)\b.*\bplatform\b/.test(text)
+  )
+}
+
 export const founderSessionsRouter = new Hono<HonoEnv>()
 
 // ── Shared Zod schemas ────────────────────────────────────────────────────────
@@ -99,9 +122,11 @@ founderSessionsRouter.post(
 
     const startup = await requireStartupOwner(startupId, userId)
 
+    const marketplaceDetected = classifyMarketplaceFromIdea(body.idea)
+
     const [session] = await db
       .insert(founderSessions)
-      .values({ startupId, userId, idea: body.idea, status: 'active', founderStage: body.founderStage })
+      .values({ startupId, userId, idea: body.idea, status: 'active', founderStage: body.founderStage, marketplaceDetected })
       .returning()
 
     await logActivity(db, {
@@ -109,7 +134,7 @@ founderSessionsRouter.post(
       startupId,
       type:        'session.started',
       description: `Founder session started for "${startup.name}"`,
-      meta:        { sessionId: session.id, founderStage: body.founderStage },
+      meta:        { sessionId: session.id, founderStage: body.founderStage, marketplaceDetected },
     })
 
     return c.json({ data: session }, 201)
@@ -266,11 +291,15 @@ founderSessionsRouter.post(
     const sessionFounderStage = parsedStage.success ? parsedStage.data : 'building'
 
     // Sprint 2.5 / v2.1: system prompt is gap-aware and stage-aware.
+    // v2.2 PR2: pass session-level marketplaceDetected so first-turn prompt is platform-aware
+    // even before a founder_understanding row exists.
+    const sessionMarketplaceDetected = session.marketplaceDetected || currentUnderstanding.marketplaceDetected
     const systemPrompt = buildChatSystemPrompt(
       startup,
       latestSummary,
       currentUnderstanding,
       sessionFounderStage,
+      sessionMarketplaceDetected,
     )
 
     // Reconstruct conversation history from session answers.
@@ -489,9 +518,11 @@ founderSessionsRouter.post(
                     sessionId,
                     startupId,
                     userId,
-                    memory:          merged,
-                    sourceMessageId: job.id,
-                    founderStage:    sessionFounderStage,
+                    memory:               merged,
+                    sourceMessageId:      job.id,
+                    founderStage:         sessionFounderStage,
+                    messagesCount:        newCount,
+                    marketplaceDetected:  sessionMarketplaceDetected,
                   })
 
                   // 7. Close the session when understanding is complete.

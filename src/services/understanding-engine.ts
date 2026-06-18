@@ -33,6 +33,11 @@ export interface UpdateUnderstandingParams {
   memory:          FounderMemory
   sourceMessageId?: string
   founderStage?:   FounderStage
+  // v2.2: used by the minimum-exchange gate to suppress completion until the session
+  // has enough depth. The router passes (session.messagesCount + 1) as the post-increment count.
+  messagesCount?:  number
+  // v2.2 PR2: seed from the session-init heuristic; OR'd with existing understanding for stickiness.
+  marketplaceDetected?: boolean
 }
 
 export interface UpdateUnderstandingResult {
@@ -54,7 +59,7 @@ export interface UpdateUnderstandingResult {
 export async function updateUnderstanding(
   params: UpdateUnderstandingParams,
 ): Promise<UpdateUnderstandingResult> {
-  const { db, sessionId, startupId, userId, memory, sourceMessageId, founderStage = 'building' } = params
+  const { db, sessionId, startupId, userId, memory, sourceMessageId, founderStage = 'building', messagesCount = 0, marketplaceDetected: seedMarketplaceDetected = false } = params
 
   // Load existing row to access accumulated evidence (never lost across turns).
   const existingRow = await db.query.founderUnderstanding.findFirst({
@@ -115,11 +120,15 @@ export async function updateUnderstanding(
   // v2.1 F3: multiIcpDetected is sticky — once true it stays true across turns.
   const multiIcpDetected = existingUnderstanding.multiIcpDetected || (memory.multi_icp_detected ?? false)
 
+  // v2.2 PR2: marketplaceDetected is sticky — once true it stays true across turns.
+  // Seeded at session creation by the heuristic; confirmed/corrected by LLM extraction each turn.
+  const marketplaceDetected = existingUnderstanding.marketplaceDetected || seedMarketplaceDetected || (memory.marketplace_detected ?? false)
+
   // v2.1 F4: pivot_detected is per-turn (replace-with-latest from memory).
   const pivotDetected    = memory.pivot_detected ?? false
   const existingPivotCount = existingUnderstanding.pivotCount ?? 0
 
-  const understanding = buildUnderstanding({
+  let understanding = buildUnderstanding({
     categoryConfidence:          memory.category_confidence,
     categoryEvidence:            memory.category_evidence,
     categoryStrength,
@@ -133,9 +142,33 @@ export async function updateUnderstanding(
     founderStage,
     maxEvidenceStrength: overallEvidenceStrength,
     multiIcpDetected,
+    marketplaceDetected,
     pivotDetected,
     existingPivotCount,
   })
+
+  // v2.2: Minimum-exchange gate — prevent completion on narrative coherence alone.
+  // Stage-specific thresholds: revenue founders have paying-customer data and can
+  // establish quality evidence faster; idea/building founders need more exploration depth.
+  // These defaults are tunable via environment variables without redeployment.
+  const MIN_EXCHANGES: Record<FounderStage, number> = {
+    idea:     Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_IDEA     ?? 6),
+    building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 8),
+    revenue:  Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_REVENUE  ?? 6),
+  }
+  if (understanding.isComplete && messagesCount < MIN_EXCHANGES[founderStage]) {
+    // Suppress completion: clear all completion-specific fields so the front-end
+    // does not transition to the complete state prematurely. Confidence scores,
+    // evidence, and saturation state are preserved — only the completion signal
+    // is held back until the exchange floor is met.
+    understanding = {
+      ...understanding,
+      isComplete:       false,
+      warnings:         [],
+      gapsInBlueprint:  [],
+      completionReason: undefined,
+    }
+  }
 
   // Determine evidence items that are new this turn.
   const newEvidenceByCategory: Partial<Record<UnderstandingCategory, string[]>> = {}
@@ -159,10 +192,12 @@ export async function updateUnderstanding(
     competitionConfidence:  understanding.categories.competition.confidence,
     risksConfidence:        understanding.categories.risks.confidence,
     founderFitConfidence:   understanding.categories.founder_fit.confidence,    // Revision 2
+    supplySideConfidence:   understanding.categories.supply_side.confidence,    // v2.2 PR3
     overallConfidence:      understanding.overallConfidence,
     overallEvidenceStrength,                                                    // Revision 3
     isComplete:             understanding.isComplete,
     weakestCategory:        understanding.weakestCategory,
+    marketplaceDetected:    understanding.marketplaceDetected,
     understanding,
     updatedAt:              new Date(),
   }
@@ -288,6 +323,16 @@ export async function updateUnderstanding(
       userId, startupId,
       type:        'understanding.multi_icp_detected',
       description: `Multi-ICP / marketplace detected for session ${sessionId}`,
+      meta:        { sessionId },
+    }))
+  }
+
+  // v2.2 PR2: fires once when marketplaceDetected transitions false → true.
+  if (!existingUnderstanding.marketplaceDetected && understanding.marketplaceDetected) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.marketplace_detected',
+      description: `Marketplace platform detected for session ${sessionId}`,
       meta:        { sessionId },
     }))
   }

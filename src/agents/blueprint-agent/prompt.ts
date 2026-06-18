@@ -47,6 +47,7 @@ const OA_TO_BLUEPRINT_RISK_CATEGORY: Record<UnderstandingCategory, string> = {
   competition: 'competition',
   risks:       'product',
   founder_fit: 'team',
+  supply_side: 'market',  // v2.2 PR3: supply-side acquisition risk maps to market risk
 }
 
 // ── System prompt ─────────────────────────────────────────────────────────────

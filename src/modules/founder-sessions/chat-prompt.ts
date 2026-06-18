@@ -24,6 +24,8 @@ const CATEGORY_FOCUS_GUIDANCE: Record<UnderstandingCategory, string> = {
   risks:        'the biggest threats to viability and the key unproven assumptions',
   // Revision 2: founder_fit probes credibility and execution capability.
   founder_fit:  'the founder\'s domain expertise, existing customer relationships, and what makes them uniquely positioned to win',
+  // v2.2 PR3: supply-side probes provider acquisition, quality, and retention for marketplace startups.
+  supply_side:  'how supply-side participants (providers, sellers, hosts, drivers) are recruited, onboarded, quality-controlled, and retained',
 }
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -37,7 +39,11 @@ export function buildChatSystemPrompt(
   latestSummary: SessionSummary | null,
   understanding: FounderUnderstanding = EMPTY_UNDERSTANDING,
   founderStage: FounderStage = 'building',
+  // v2.2 PR2: pass the session-level flag so the first-turn prompt is marketplace-aware
+  // even before the understanding row exists. Falls back to understanding.marketplaceDetected.
+  marketplaceDetected?: boolean,
 ): string {
+  const effectiveMarketplaceDetected = marketplaceDetected ?? understanding.marketplaceDetected
   const lines: string[] = [
     'You are an experienced startup advisor and AI Technical Cofounder.',
     'Your role is to deeply understand the startup through investigative conversation.',
@@ -94,13 +100,29 @@ export function buildChatSystemPrompt(
     )
   }
 
+  if (effectiveMarketplaceDetected) {
+    lines.push(
+      '',
+      '--- MARKETPLACE PLATFORM ---',
+      'This startup is a two-sided marketplace or platform.',
+      'Both supply-side (providers, sellers, hosts, drivers) and demand-side (buyers, users, guests, riders) must be understood.',
+      'When exploring the customer dimension, ask about BOTH sides — who creates value and who consumes it.',
+      'Supply-side acquisition and quality control are often the harder constraint for marketplace startups.',
+    )
+  }
+
   if (understanding.weakestCategory !== null) {
     lines.push('', '--- CURRENT UNDERSTANDING STATE ---')
 
     for (const [cat, state] of Object.entries(understanding.categories) as [UnderstandingCategory, typeof understanding.categories.problem][]) {
+      // supply_side is invisible to non-marketplace sessions — omit from prompt entirely.
+      if (cat === 'supply_side' && !effectiveMarketplaceDetected) continue
+
       const statusIcon    = state.status === 'complete' ? '✓' : state.status === 'partial' ? '~' : '?'
       const strengthLabel = EVIDENCE_STRENGTH_LEVELS[state.evidenceStrength] ?? 'Unknown'
-      const requiredFlag  = CATEGORY_DISPLAY[cat].required ? ' [required]' : ''
+      // supply_side is effectively required for marketplace sessions even though CATEGORY_DISPLAY marks it false.
+      const isRequired    = CATEGORY_DISPLAY[cat].required || (cat === 'supply_side' && effectiveMarketplaceDetected)
+      const requiredFlag  = isRequired ? ' [required]' : ''
       const gapFlag       = state.validationStatus === 'explicitly_unvalidated' ? ' [gap confirmed]' : ''
       lines.push(
         `${statusIcon} ${CATEGORY_DISPLAY[cat].label}${requiredFlag}${gapFlag}: ${state.confidence}% (${strengthLabel})`,
@@ -245,7 +267,24 @@ export function buildChatSystemPrompt(
       const categoryName = CATEGORY_DISPLAY[weakest].label
       const strengthLabel = EVIDENCE_STRENGTH_LEVELS[weakestState.evidenceStrength]
 
-      if (weakest === 'customer' && understanding.multiIcpDetected) {
+      if (weakest === 'supply_side' && effectiveMarketplaceDetected) {
+        // v2.2 PR3: Supply-side is the weakest category for a marketplace — probe provider dynamics.
+        lines.push(
+          '',
+          '--- FOCUS INSTRUCTION (SUPPLY SIDE) ---',
+          'This marketplace startup has not yet explored its supply side.',
+          `Supply Side understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
+          'The supply side = the independent providers, sellers, hosts, or drivers who create value on the platform.',
+          'Your next question MUST investigate one of:',
+          '  - How does the startup recruit supply-side participants? (GTM for supply)',
+          '  - What makes supply-side participants choose this platform over alternatives?',
+          '  - How does the startup ensure supply quality? (screening, rating, or curation)',
+          '  - What is the supply-side retention strategy?',
+          'Do NOT conflate supply-side with the demand-side (buyers/users) in your question.',
+          'Example: "How do you plan to bring on your first [providers/sellers/hosts] — ',
+          'what makes them want to list on your platform over just going direct?"',
+        )
+      } else if (weakest === 'customer' && understanding.multiIcpDetected) {
         // v2.1 F3: Multi-ICP / marketplace customer focus — shift from single ICP to beachhead.
         lines.push(
           '',
@@ -335,8 +374,9 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'integer' },
           risks:       { type: 'integer' },
           founder_fit: { type: 'integer' },  // Revision 2
+          supply_side: { type: 'integer' },  // v2.2 PR3 — score 0 for non-marketplace
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
 
@@ -352,8 +392,9 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'array', items: { type: 'string' }, maxItems: 3 },
           risks:       { type: 'array', items: { type: 'string' }, maxItems: 3 },
           founder_fit: { type: 'array', items: { type: 'string' }, maxItems: 3 },  // Revision 2
+          supply_side: { type: 'array', items: { type: 'string' }, maxItems: 3 },  // v2.2 PR3
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
 
@@ -373,8 +414,9 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'integer', minimum: 1, maximum: 6 },
           risks:       { type: 'integer', minimum: 1, maximum: 6 },
           founder_fit: { type: 'integer', minimum: 1, maximum: 6 },
+          supply_side: { type: 'integer', minimum: 1, maximum: 6 },  // v2.2 PR3
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
 
@@ -383,6 +425,14 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
       // where both sides have materially different pricing or service models.
       // Do NOT set true for buyer/user splits, segment variations, or discovery uncertainty.
       multi_icp_detected: { type: 'boolean' },
+
+      // ── v2.2 PR2: Marketplace platform detection ──────────────────────────
+      // Set true ONLY for genuine two-sided platforms where distinct supply-side participants
+      // CREATE value and distinct demand-side participants CONSUME it.
+      // Supply-side participants are recruited, onboarded, and managed separately from buyers.
+      // Examples: Airbnb (hosts+guests), Uber (drivers+riders), Etsy (sellers+buyers).
+      // Do NOT set true for: SaaS with multiple user roles, B2B2C, or buyer/user splits.
+      marketplace_detected: { type: 'boolean' },
 
       // ── v2.1 F4: Pivot detection ───────────────────────────────────────────
       // Set true ONLY when a genuine mid-session direction change is detected — the
@@ -407,8 +457,9 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'string', enum: ['none', 'weak', 'strong'] },
           risks:       { type: 'string', enum: ['none', 'weak', 'strong'] },
           founder_fit: { type: 'string', enum: ['none', 'weak', 'strong'] },
+          supply_side: { type: 'string', enum: ['none', 'weak', 'strong'] },  // v2.2 PR3
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
     },
@@ -419,7 +470,7 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
       'risks', 'key_insights', 'confidence_score',
       'category_confidence', 'category_evidence', 'category_evidence_strength',
       'category_absence_signals',
-      'multi_icp_detected', 'pivot_detected',
+      'multi_icp_detected', 'marketplace_detected', 'pivot_detected',
     ],
     additionalProperties: false,
   },
@@ -465,6 +516,16 @@ export function buildMemoryExtractionSystemPrompt(
     '    execution track record, unique insights, and reasons they specifically can win.',
     '  - 0 = no information about the founder at all.',
     '  - 80+ = clear, specific evidence of domain authority and customer access.',
+    '',
+    'SUPPLY SIDE scoring guidance (supply_side):',
+    '  - Only relevant for genuine marketplace/platform startups (e.g. Airbnb, Uber, Etsy patterns).',
+    '  - Score based on: how supply-side participants are recruited, onboarded, quality-controlled,',
+    '    and retained. Supply-side = providers, sellers, hosts, drivers, freelancers, etc.',
+    '  - For non-marketplace startups: output supply_side = 0, evidence = [], strength = 1.',
+    '  - 0   = startup is not a marketplace, OR supply-side has not been discussed.',
+    '  - 30+ = founder has described who the supply-side participants are.',
+    '  - 60+ = founder has explained how they will acquire and onboard supply-side participants.',
+    '  - 80+ = founder has evidence of supply-side acquisition (sign-ups, waitlist, partnerships).',
     '',
     'EVIDENCE STRENGTH (1-6 per category, rate HIGHEST level present):',
     '  1 = Founder assumption OR category not discussed this turn (minimum floor — never output 0)',
@@ -519,6 +580,22 @@ export function buildMemoryExtractionSystemPrompt(
     '  - Segment variations (enterprise vs SMB — same side, different sizes)',
     '  - Uncertainty about who the customer is ("I\'m not sure if it\'s HR or IT")',
     '  - B2B2C where only one side pays',
+    'Default: false.',
+    '',
+    'MARKETPLACE PLATFORM DETECTION (marketplace_detected):',
+    'Set marketplace_detected = true ONLY when the startup is a genuine two-sided PLATFORM where:',
+    '  1. Supply-side participants INDEPENDENTLY CREATE value (they are recruited and onboarded separately)',
+    '  2. Demand-side participants CONSUME that value',
+    '  3. The platform\'s job is to match and connect the two sides',
+    'Classic pattern: Airbnb (hosts create listings → guests consume them), Uber (drivers provide rides',
+    '→ riders consume them), Etsy (sellers create products → buyers purchase them).',
+    'The key test: does the startup need to RECRUIT, ONBOARD, and MANAGE a supply side separately?',
+    'If yes → marketplace_detected = true.',
+    'Do NOT set true for:',
+    '  - SaaS tools used by multiple types of users (HR tool used by managers AND employees)',
+    '  - B2B2C where the supply side is a single business, not a network of independent providers',
+    '  - Consulting, agency, or service businesses with clients and vendors',
+    '  - Dual-segment B2B businesses (marketplace_detected is about platform structure, not segments)',
     'Default: false.',
     '',
     'PIVOT DETECTION (pivot_detected):',

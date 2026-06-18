@@ -1,4 +1,4 @@
-import { check, decimal, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { boolean, check, decimal, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import { questionTypeEnum, sessionStatusEnum } from './enums.ts'
 import { startups } from './startups.ts'
@@ -12,6 +12,8 @@ export const founderSessions = pgTable('founder_sessions', {
   idea: text('idea').notNull(),
   status: sessionStatusEnum('status').notNull().default('active'),
   founderStage: text('founder_stage').notNull().default('building'),
+  // v2.2 PR2: set at session creation by the heuristic classifier; sticky via the engine thereafter.
+  marketplaceDetected: boolean('marketplace_detected').notNull().default(false),
   messagesCount: integer('messages_count').notNull().default(0),
   sessionDurationSeconds: integer('session_duration_seconds'),
   avgMessageLength: integer('avg_message_length'),
