@@ -11,6 +11,7 @@ export const founderSessions = pgTable('founder_sessions', {
   userId: uuid('user_id').notNull(),
   idea: text('idea').notNull(),
   status: sessionStatusEnum('status').notNull().default('active'),
+  founderStage: text('founder_stage').notNull().default('building'),
   messagesCount: integer('messages_count').notNull().default(0),
   sessionDurationSeconds: integer('session_duration_seconds'),
   avgMessageLength: integer('avg_message_length'),

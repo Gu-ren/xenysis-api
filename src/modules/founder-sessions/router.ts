@@ -26,6 +26,7 @@ import { FounderMemorySchema, EMPTY_FOUNDER_MEMORY, mergeFounderMemory, type Fou
 import { SessionSummarySchema } from '../../lib/contracts/session-summary.ts'
 import {
   FounderUnderstandingSchema,
+  FounderStageSchema,
   EMPTY_UNDERSTANDING,
 } from '../../lib/contracts/founder-understanding.ts'
 import { logActivity, trackUsage, estimateTokens, fromOpenAI } from '../../agents/base/utils.ts'
@@ -50,7 +51,8 @@ const sessionIdParam = z.object({
 })
 
 const createSessionBody = z.object({
-  idea: z.string().min(10, 'Idea must be at least 10 characters').max(2000),
+  idea:         z.string().min(10, 'Idea must be at least 10 characters').max(2000),
+  founderStage: z.enum(['idea', 'building', 'revenue']).default('building'),
 })
 
 const addAnswerBody = z.object({
@@ -99,7 +101,7 @@ founderSessionsRouter.post(
 
     const [session] = await db
       .insert(founderSessions)
-      .values({ startupId, userId, idea: body.idea, status: 'active' })
+      .values({ startupId, userId, idea: body.idea, status: 'active', founderStage: body.founderStage })
       .returning()
 
     await logActivity(db, {
@@ -107,7 +109,7 @@ founderSessionsRouter.post(
       startupId,
       type:        'session.started',
       description: `Founder session started for "${startup.name}"`,
-      meta:        { sessionId: session.id },
+      meta:        { sessionId: session.id, founderStage: body.founderStage },
     })
 
     return c.json({ data: session }, 201)
@@ -260,8 +262,16 @@ founderSessionsRouter.post(
       ? (FounderMemorySchema.safeParse(existingMemoryRow.memory).data ?? null)
       : null
 
-    // Sprint 2.5: system prompt is now gap-aware.
-    const systemPrompt = buildChatSystemPrompt(startup, latestSummary, currentUnderstanding)
+    const parsedStage = FounderStageSchema.safeParse(session.founderStage)
+    const sessionFounderStage = parsedStage.success ? parsedStage.data : 'building'
+
+    // Sprint 2.5 / v2.1: system prompt is gap-aware and stage-aware.
+    const systemPrompt = buildChatSystemPrompt(
+      startup,
+      latestSummary,
+      currentUnderstanding,
+      sessionFounderStage,
+    )
 
     // Reconstruct conversation history from session answers.
     const historyMessages: Array<{ role: 'user' | 'assistant'; content: string }> =
@@ -481,6 +491,7 @@ founderSessionsRouter.post(
                     userId,
                     memory:          merged,
                     sourceMessageId: job.id,
+                    founderStage:    sessionFounderStage,
                   })
 
                   // 7. Close the session when understanding is complete.
@@ -497,6 +508,27 @@ founderSessionsRouter.post(
                         updatedAt:              new Date(),
                       })
                       .where(eq(founderSessions.id, sessionId))
+
+                    await logActivity(db, {
+                      userId,
+                      startupId,
+                      type:        'session.completed',
+                      description: `Founder session completed for startup ${startupId}`,
+                      meta: {
+                        sessionId,
+                        founderStage:        session.founderStage ?? 'building',
+                        blueprintMode:       understandingResult.understanding.blueprintMode,
+                        overallConfidence:   understandingResult.overallConfidence,
+                        messagesCount:       session.messagesCount + 1,
+                        durationSeconds,
+                        gapsInBlueprint:     understandingResult.understanding.gapsInBlueprint,
+                        requiredConfidence: {
+                          problem:  understandingResult.understanding.categories.problem.confidence,
+                          customer: understandingResult.understanding.categories.customer.confidence,
+                          solution: understandingResult.understanding.categories.solution.confidence,
+                        },
+                      },
+                    })
                   }
                 }
               }

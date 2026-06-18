@@ -146,6 +146,15 @@ export const FounderMemorySchema = z.object({
     risks:       'none',
     founder_fit: 'none',
   }),
+
+  // v2.1 F3: replace-with-latest per turn. True only for genuine two-sided marketplaces
+  // or dual-segment businesses with meaningfully different pricing/service models.
+  // Once true in FounderUnderstanding, it stays true (stickiness is in the engine, not here).
+  multi_icp_detected: z.boolean().default(false),
+
+  // v2.1 F4: replace-with-latest per turn. True on the specific turn where a genuine
+  // mid-session pivot is detected. Does NOT trigger confidence merge bypass (v2.2).
+  pivot_detected: z.boolean().default(false),
 })
 
 export type FounderMemory = z.infer<typeof FounderMemorySchema>
@@ -275,6 +284,18 @@ export function mergeFounderMemory(
       ...existing.category_absence_signals,
       ...extracted.category_absence_signals,
     }
+  }
+
+  // v2.1 F3: replace-with-latest. Stickiness (once-true-stays-true) is enforced in the
+  // understanding engine, not here — memory always reflects the current turn's LLM output.
+  if (typeof extracted.multi_icp_detected === 'boolean') {
+    merged.multi_icp_detected = extracted.multi_icp_detected
+  }
+
+  // v2.1 F4: replace-with-latest per turn. True only on the turn the pivot is detected.
+  // No confidence merge bypass — that is v2.2.
+  if (typeof extracted.pivot_detected === 'boolean') {
+    merged.pivot_detected = extracted.pivot_detected
   }
 
   return merged

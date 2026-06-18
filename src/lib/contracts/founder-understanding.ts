@@ -88,14 +88,33 @@ export const CATEGORY_IMPORTANCE: Record<UnderstandingCategory, number> = {
 const TOTAL_WEIGHT = Object.values(CATEGORY_IMPORTANCE).reduce((a, b) => a + b, 0) // 72
 
 // Confidence thresholds for status derivation.
-const THRESHOLD_PARTIAL  = 30    // below this → missing
-const THRESHOLD_COMPLETE = 80    // at or above this → complete
+const THRESHOLD_PARTIAL = 30    // below this → missing
 
 // Warning threshold for supporting categories in the Founder Report.
 export const SUPPORTING_WARNING_THRESHOLD = 60
 
 // Revision 4: overall threshold relaxed from 80 → 75.
 export const COMPLETION_OVERALL_THRESHOLD = 75
+
+// ── Founder stage ─────────────────────────────────────────────────────────────
+// Declared at session creation, immutable for the session lifetime.
+//   idea:     Pre-validation — founder has an idea but has not spoken to customers.
+//   building: Active development — some validation underway.
+//   revenue:  Revenue-stage — paying customers exist.
+export const FounderStageSchema = z.enum(['idea', 'building', 'revenue'])
+export type FounderStage = z.infer<typeof FounderStageSchema>
+
+// ── Blueprint mode ────────────────────────────────────────────────────────────
+// Determined at session completion.
+//   hypothesis: Session completed via the idea-stage lower threshold (THRESHOLD_HYPOTHESIS).
+//               Blueprint is a thinking tool — not a validated spec.
+//   validated:  All required categories naturally reached THRESHOLD_COMPLETE (80%).
+export const BlueprintModeSchema = z.enum(['hypothesis', 'validated'])
+export type BlueprintMode = z.infer<typeof BlueprintModeSchema>
+
+// Completion thresholds.
+export const THRESHOLD_COMPLETE   = 80   // building / revenue stage (and evidence floor)
+export const THRESHOLD_HYPOTHESIS = 60   // idea stage only
 
 // ── Evidence strength ─────────────────────────────────────────────────────────
 // Revision 3: tracks the quality of evidence behind a confidence score.
@@ -192,6 +211,24 @@ export const FounderUnderstandingSchema = z.object({
   // Session-level questioning orientation — shifts to gap_identification when all categories
   // are either well-understood, validated, explicitly_unvalidated, or saturated.
   questioningMode: QuestioningModeSchema.default('discovery'),
+
+  // v2.1 fields — F1+F2.
+  founderStage:     FounderStageSchema.default('building'),
+  blueprintMode:    BlueprintModeSchema.default('validated'),
+  gapsInBlueprint:  z.array(
+    z.enum(['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit']),
+  ).default([]),
+
+  // v2.1 F3: sticky — once true, stays true for the session lifetime.
+  // Suppresses customer from the blocked-topics list and changes the focus instruction.
+  multiIcpDetected: z.boolean().default(false),
+
+  // v2.1 F4: per-turn — true only on the turn a pivot is detected.
+  // Does NOT bypass confidence merge (v2.2). Used for chat acknowledgment + analytics.
+  pivotDetected: z.boolean().default(false),
+
+  // v2.1 F4: lifetime accumulator — increments each turn pivotDetected = true.
+  pivotCount: z.number().int().min(0).default(0),
 })
 export type FounderUnderstanding = z.infer<typeof FounderUnderstandingSchema>
 
@@ -233,6 +270,7 @@ export function detectWeakestCategory(
   categoryConfidence: Record<UnderstandingCategory, number>,
   focusHistory: string[] = [],
   saturationCounts: Partial<Record<UnderstandingCategory, number>> = {},
+  multiIcpDetected: boolean = false,
 ): UnderstandingCategory {
   let maxPriority = -1
   let weakest: UnderstandingCategory = 'competition'
@@ -243,7 +281,10 @@ export function detectWeakestCategory(
     const coolMult     = COOLING_MULTIPLIERS[recentCount] ?? 1.0
     // Saturated categories get a near-zero multiplier — they are exhausted and should not
     // be selected again until a new evidence breakthrough resets the saturation counter.
-    const satMult      = (saturationCounts[cat] ?? 0) >= SATURATION_THRESHOLD ? 0.02 : 1.0
+    // Exception: customer saturation is suppressed when multiIcpDetected — marketplace
+    // founders legitimately need continued customer exploration across both ICP segments.
+    const isSaturated  = (saturationCounts[cat] ?? 0) >= SATURATION_THRESHOLD
+    const satMult      = (isSaturated && !(cat === 'customer' && multiIcpDetected)) ? 0.02 : 1.0
     const effectivePriority = basePriority * coolMult * satMult
 
     if (effectivePriority > maxPriority) {
@@ -256,17 +297,19 @@ export function detectWeakestCategory(
 }
 
 // Revision 4: completion requires only the three required categories at ≥ 80.
-// Supporting categories generate warnings but do NOT block completion.
-// overallConfidence is retained as a display metric but is not used for the completion
-// gate — competition's weight (10) in the overall formula made the gate fire too late
-// (session with problem/customer/solution at 90/90/85 + all supporting at ~40% scored
-// overall 59%, permanently blocking completion despite the required areas being strong).
+// v2.1: 'idea'-stage founders use THRESHOLD_HYPOTHESIS (60) unless the evidence floor fires.
+// Evidence floor: if maxEvidenceStrength >= 4 (customer interviews or better), always use
+// THRESHOLD_COMPLETE regardless of declared stage — prevents gaming the idea threshold.
 export function checkCompletion(
   categoryConfidence: Record<UnderstandingCategory, number>,
   _overallConfidence: number,
+  founderStage: FounderStage = 'building',
+  maxEvidenceStrength: EvidenceStrength = 1,
 ): boolean {
+  const stageThreshold = founderStage === 'idea' ? THRESHOLD_HYPOTHESIS : THRESHOLD_COMPLETE
+  const threshold = maxEvidenceStrength >= 4 ? THRESHOLD_COMPLETE : stageThreshold
   return REQUIRED_CATEGORIES.every(
-    (cat) => (categoryConfidence[cat] ?? 0) >= THRESHOLD_COMPLETE,
+    (cat) => (categoryConfidence[cat] ?? 0) >= threshold,
   )
 }
 
@@ -383,6 +426,13 @@ export function buildUnderstanding(params: {
   existingWeakAbsenceCounts?:   Record<UnderstandingCategory, number>
   existingSaturationCounts?:    Record<UnderstandingCategory, number>
   existingLastFocusConfidence?: Record<UnderstandingCategory, number>
+  // v2.1 F1+F2:
+  founderStage?:        FounderStage
+  maxEvidenceStrength?: EvidenceStrength
+  // v2.1 F3+F4:
+  multiIcpDetected?:   boolean
+  pivotDetected?:      boolean
+  existingPivotCount?: number
 }): FounderUnderstanding {
   const {
     categoryConfidence,
@@ -395,13 +445,18 @@ export function buildUnderstanding(params: {
     existingWeakAbsenceCounts  = {} as Record<UnderstandingCategory, number>,
     existingSaturationCounts   = {} as Record<UnderstandingCategory, number>,
     existingLastFocusConfidence = {} as Record<UnderstandingCategory, number>,
+    founderStage        = 'building',
+    maxEvidenceStrength = 1,
+    multiIcpDetected    = false,
+    pivotDetected       = false,
+    existingPivotCount  = 0,
   } = params
 
   // The category at focusHistory[0] was the weakest last turn — used for saturation delta check.
   const lastFocusCat = (focusHistory[0] ?? null) as UnderstandingCategory | null
 
   const overallConfidence = computeOverallConfidence(categoryConfidence)
-  const isComplete        = checkCompletion(categoryConfidence, overallConfidence)
+  const isComplete        = checkCompletion(categoryConfidence, overallConfidence, founderStage, maxEvidenceStrength)
 
   // Evidence accumulates across turns (append unique, cap at 5).
   const mergeEvidence = (existing: string[], incoming: string[]): string[] => {
@@ -457,7 +512,7 @@ export function buildUnderstanding(params: {
     }),
   ) as FounderUnderstanding['categories']
 
-  const weakestCategory = detectWeakestCategory(categoryConfidence, focusHistory, saturationCountsForDetect)
+  const weakestCategory = detectWeakestCategory(categoryConfidence, focusHistory, saturationCountsForDetect, multiIcpDetected)
   const warnings        = isComplete
     ? buildCompletionWarnings(categoryConfidence, categoryStrength)
     : []
@@ -466,6 +521,23 @@ export function buildUnderstanding(params: {
     (cat) => categories[cat].validationStatus === 'explicitly_unvalidated',
   )
   const questioningMode = detectQuestioningMode(categories)
+
+  // v2.1 F4: pivot accumulator increments each turn a pivot is detected.
+  const pivotCount = existingPivotCount + (pivotDetected ? 1 : 0)
+
+  // v2.1 F2: blueprintMode — 'hypothesis' only when the session completed via the
+  // idea-stage lower threshold AND required cats did not naturally reach 80.
+  const hypothesisCompletion = isComplete
+    && founderStage === 'idea'
+    && REQUIRED_CATEGORIES.every((cat) => (categoryConfidence[cat] ?? 0) < THRESHOLD_COMPLETE)
+  const blueprintMode: BlueprintMode = hypothesisCompletion ? 'hypothesis' : 'validated'
+
+  // v2.1 F5: gapsInBlueprint — explicitly_unvalidated categories at completion time.
+  const gapsInBlueprint = isComplete
+    ? (UNDERSTANDING_CATEGORIES.filter(
+        (cat) => categories[cat].validationStatus === 'explicitly_unvalidated',
+      ) as FounderUnderstanding['gapsInBlueprint'])
+    : []
 
   return {
     _schemaVersion: '1.1',
@@ -480,6 +552,12 @@ export function buildUnderstanding(params: {
     focusHistory,
     validationGaps,
     questioningMode,
+    founderStage,
+    blueprintMode,
+    gapsInBlueprint,
+    multiIcpDetected,
+    pivotDetected,
+    pivotCount,
   }
 }
 
@@ -517,6 +595,12 @@ export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
   focusHistory:      [],
   validationGaps:    [],
   questioningMode:   'discovery',
+  founderStage:      'building',
+  blueprintMode:     'validated',
+  gapsInBlueprint:   [],
+  multiIcpDetected:  false,
+  pivotDetected:     false,
+  pivotCount:        0,
 }
 
 // ── UI progress model ─────────────────────────────────────────────────────────

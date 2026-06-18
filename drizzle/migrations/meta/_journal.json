@@ -36,6 +36,13 @@
       "when": 1781460177272,
       "tag": "0004_brown_forge",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1750118400000,
+      "tag": "0005_founder_stage",
+      "breakpoints": true
     }
   ]
 }

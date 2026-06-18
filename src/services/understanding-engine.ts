@@ -2,13 +2,16 @@ import { eq } from 'drizzle-orm'
 import type { DB as DrizzleDB } from '../lib/db/index.ts'
 import { evidenceRecords, founderUnderstanding } from '../lib/db/schema/understanding.ts'
 import type { FounderMemory } from '../lib/contracts/founder-memory.ts'
+import { logActivity } from '../agents/base/utils.ts'
 import {
   type FounderUnderstanding,
   type UnderstandingCategory,
   type EvidenceStrength,
   type ValidationStatus,
   type AbsenceSignalStrength,
+  type FounderStage,
   UNDERSTANDING_CATEGORIES,
+  SATURATION_THRESHOLD,
   buildUnderstanding,
   EMPTY_UNDERSTANDING,
   FounderUnderstandingSchema,
@@ -29,6 +32,7 @@ export interface UpdateUnderstandingParams {
   userId:          string
   memory:          FounderMemory
   sourceMessageId?: string
+  founderStage?:   FounderStage
 }
 
 export interface UpdateUnderstandingResult {
@@ -50,7 +54,7 @@ export interface UpdateUnderstandingResult {
 export async function updateUnderstanding(
   params: UpdateUnderstandingParams,
 ): Promise<UpdateUnderstandingResult> {
-  const { db, sessionId, startupId, userId, memory, sourceMessageId } = params
+  const { db, sessionId, startupId, userId, memory, sourceMessageId, founderStage = 'building' } = params
 
   // Load existing row to access accumulated evidence (never lost across turns).
   const existingRow = await db.query.founderUnderstanding.findFirst({
@@ -103,6 +107,18 @@ export async function updateUnderstanding(
     ? [existingUnderstanding.weakestCategory, ...existingFocusHistory].slice(0, 5)
     : existingFocusHistory
 
+  // Compute overall evidence strength before buildUnderstanding so it can inform the threshold.
+  const overallEvidenceStrength = Math.max(
+    ...UNDERSTANDING_CATEGORIES.map((cat) => categoryStrength[cat] ?? 1),
+  ) as EvidenceStrength
+
+  // v2.1 F3: multiIcpDetected is sticky — once true it stays true across turns.
+  const multiIcpDetected = existingUnderstanding.multiIcpDetected || (memory.multi_icp_detected ?? false)
+
+  // v2.1 F4: pivot_detected is per-turn (replace-with-latest from memory).
+  const pivotDetected    = memory.pivot_detected ?? false
+  const existingPivotCount = existingUnderstanding.pivotCount ?? 0
+
   const understanding = buildUnderstanding({
     categoryConfidence:          memory.category_confidence,
     categoryEvidence:            memory.category_evidence,
@@ -114,6 +130,11 @@ export async function updateUnderstanding(
     existingWeakAbsenceCounts,
     existingSaturationCounts,
     existingLastFocusConfidence,
+    founderStage,
+    maxEvidenceStrength: overallEvidenceStrength,
+    multiIcpDetected,
+    pivotDetected,
+    existingPivotCount,
   })
 
   // Determine evidence items that are new this turn.
@@ -124,11 +145,6 @@ export async function updateUnderstanding(
     const newItems         = incoming.filter((item) => !alreadyPersisted.has(item))
     if (newItems.length > 0) newEvidenceByCategory[cat] = newItems
   }
-
-  // Compute overall evidence strength: maximum across all categories.
-  const overallEvidenceStrength = Math.max(
-    ...UNDERSTANDING_CATEGORIES.map((cat) => categoryStrength[cat] ?? 1),
-  ) as EvidenceStrength
 
   // Upsert founder_understanding.
   const upsertPayload = {
@@ -217,6 +233,76 @@ export async function updateUnderstanding(
   if (evidenceInserts.length > 0) {
     await db.insert(evidenceRecords).values(evidenceInserts)
   }
+
+  // v2.1 instrumentation — transition-guarded, fire-and-forget.
+  const prevIsComplete      = existingUnderstanding.isComplete
+  const prevQuestioningMode = existingUnderstanding.questioningMode
+
+  const instrumentationEvents: Promise<void>[] = []
+
+  if (!prevIsComplete && understanding.isComplete) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.completion_threshold_reached',
+      description: `Session understanding complete for session ${sessionId}`,
+      meta:        { sessionId, founderStage, blueprintMode: understanding.blueprintMode, overallConfidence: understanding.overallConfidence },
+    }))
+  }
+
+  if (prevQuestioningMode !== 'gap_identification' && understanding.questioningMode === 'gap_identification') {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.gap_identification_entered',
+      description: `Questioning mode shifted to gap_identification for session ${sessionId}`,
+      meta:        { sessionId },
+    }))
+  }
+
+  for (const cat of UNDERSTANDING_CATEGORIES) {
+    const prevSat = existingUnderstanding.categories[cat].saturationCount ?? 0
+    const newSat  = understanding.categories[cat].saturationCount
+    if (prevSat < SATURATION_THRESHOLD && newSat >= SATURATION_THRESHOLD) {
+      instrumentationEvents.push(logActivity(db, {
+        userId, startupId,
+        type:        'understanding.category_saturated',
+        description: `Category ${cat} reached saturation for session ${sessionId}`,
+        meta:        { sessionId, category: cat, confidence: understanding.categories[cat].confidence },
+      }))
+    }
+
+    const prevStatus = existingUnderstanding.categories[cat].validationStatus
+    const newStatus  = understanding.categories[cat].validationStatus
+    if (prevStatus !== 'explicitly_unvalidated' && newStatus === 'explicitly_unvalidated') {
+      instrumentationEvents.push(logActivity(db, {
+        userId, startupId,
+        type:        'understanding.gap_confirmed',
+        description: `Validation gap confirmed for category ${cat} in session ${sessionId}`,
+        meta:        { sessionId, category: cat },
+      }))
+    }
+  }
+
+  // v2.1 F3: fires once when multiIcpDetected transitions false → true.
+  if (!existingUnderstanding.multiIcpDetected && understanding.multiIcpDetected) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.multi_icp_detected',
+      description: `Multi-ICP / marketplace detected for session ${sessionId}`,
+      meta:        { sessionId },
+    }))
+  }
+
+  // v2.1 F4: fires every turn where pivotDetected = true.
+  if (understanding.pivotDetected) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.pivot_detected',
+      description: `Pivot detected in session ${sessionId}`,
+      meta:        { sessionId, pivotCount: understanding.pivotCount },
+    }))
+  }
+
+  await Promise.allSettled(instrumentationEvents)
 
   return {
     understanding,

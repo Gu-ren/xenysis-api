@@ -1,6 +1,6 @@
 import type { Startup } from '../../lib/db/schema/startups.ts'
 import type { SessionSummary } from '../../lib/contracts/session-summary.ts'
-import type { FounderUnderstanding, UnderstandingCategory } from '../../lib/contracts/founder-understanding.ts'
+import type { FounderUnderstanding, UnderstandingCategory, FounderStage } from '../../lib/contracts/founder-understanding.ts'
 import type { FounderMemory } from '../../lib/contracts/founder-memory.ts'
 import {
   CATEGORY_DISPLAY,
@@ -36,6 +36,7 @@ export function buildChatSystemPrompt(
   startup: Startup,
   latestSummary: SessionSummary | null,
   understanding: FounderUnderstanding = EMPTY_UNDERSTANDING,
+  founderStage: FounderStage = 'building',
 ): string {
   const lines: string[] = [
     'You are an experienced startup advisor and AI Technical Cofounder.',
@@ -73,6 +74,26 @@ export function buildChatSystemPrompt(
     )
   }
 
+  // SESSION MODE block — tells the advisor how to frame the conversation.
+  const modeLabel = founderStage === 'idea'
+    ? 'PRE-VALIDATION (idea stage)'
+    : founderStage === 'revenue'
+    ? 'REVENUE STAGE'
+    : 'BUILDING STAGE'
+  lines.push(
+    '',
+    '--- SESSION MODE ---',
+    `Founder stage: ${modeLabel}`,
+  )
+  if (founderStage === 'idea') {
+    lines.push(
+      'This founder is pre-validation. They may not have spoken to customers yet.',
+      'Treat confirmed knowledge gaps with curiosity, not concern.',
+      'The session can complete at 60% confidence on required categories (Problem, Customer, Solution).',
+      'The output will be framed as a hypothesis blueprint — a thinking tool, not a validated spec.',
+    )
+  }
+
   if (understanding.weakestCategory !== null) {
     lines.push('', '--- CURRENT UNDERSTANDING STATE ---')
 
@@ -90,6 +111,8 @@ export function buildChatSystemPrompt(
 
     // Blocked topics: categories that hit the saturation threshold OR have 3+ focus turns.
     // These are exhausted — questioning them yields no new information.
+    // v2.1 F3: customer saturation is suppressed when multiIcpDetected — marketplace founders
+    // have a legitimately complex customer dimension and must not be blocked there.
     const focusHistory = understanding.focusHistory ?? []
     const focusSaturated = UNDERSTANDING_CATEGORIES.filter(
       (cat) => focusHistory.filter((h) => h === cat).length >= 3,
@@ -97,14 +120,17 @@ export function buildChatSystemPrompt(
     const statSaturated = UNDERSTANDING_CATEGORIES.filter(
       (cat) => (understanding.categories[cat].saturationCount ?? 0) >= SATURATION_THRESHOLD,
     )
-    const blockedCategories = [...new Set([...focusSaturated, ...statSaturated])]
+    const allBlocked = [...new Set([...focusSaturated, ...statSaturated])]
+    const effectiveBlockedCategories = understanding.multiIcpDetected
+      ? allBlocked.filter((cat) => cat !== 'customer')
+      : allBlocked
 
-    if (blockedCategories.length > 0) {
+    if (effectiveBlockedCategories.length > 0) {
       lines.push(
         '',
         '--- BLOCKED TOPICS (DO NOT ASK ABOUT THESE) ---',
         'These categories are exhausted — repeated questioning has yielded no new information.',
-        'Do NOT ask about: ' + blockedCategories.map((c) => CATEGORY_DISPLAY[c].label).join(', ') + '.',
+        'Do NOT ask about: ' + effectiveBlockedCategories.map((c) => CATEGORY_DISPLAY[c].label).join(', ') + '.',
         'Move on. A different area of the business needs attention now.',
       )
     }
@@ -128,23 +154,73 @@ export function buildChatSystemPrompt(
       )
     }
 
+    // v2.1 F4: Pivot acknowledgment. Fires on the turn the pivot is detected.
+    // The advisor must name both directions and confirm which the founder wants to pursue.
+    // This is a chat signal only — confidence scores are NOT reset here (that is v2.2).
+    if (understanding.pivotDetected) {
+      lines.push(
+        '',
+        '--- PIVOT DETECTED ---',
+        'The founder appears to have changed direction mid-session.',
+        'Before asking your next question, briefly acknowledge this shift.',
+        'Name both directions: the original thesis and the new direction you detected.',
+        'Ask the founder to confirm which direction they want to pursue going forward.',
+        'Example: "Earlier we were exploring [X]. It sounds like you\'re now focused on [Y].',
+        'Which direction do you want to build on for this session?"',
+        'Do NOT reset the conversation or re-ask questions you already covered.',
+        'Once the founder confirms, continue from the confirmed direction.',
+      )
+    }
+
     if (understanding.isComplete) {
+      const isHypothesis = understanding.blueprintMode === 'hypothesis'
       lines.push(
         '',
         '--- SESSION STATUS: COMPLETE ---',
         'The required dimensions (Problem, Customer, Solution) are well understood.',
         'Do NOT ask any more discovery questions.',
-        'Acknowledge the conversation warmly and tell the founder that Xenysis has',
-        'enough to generate their Opportunity Assessment and Startup Blueprint.',
-        'Invite them to proceed. If any supporting areas had low confidence, mention',
-        'them briefly as areas to revisit after seeing the initial analysis.',
       )
+
+      if (isHypothesis) {
+        lines.push(
+          'This session completed as a HYPOTHESIS BLUEPRINT.',
+          'Acknowledge the conversation warmly. Tell the founder that Xenysis has captured their',
+          'hypothesis and will generate a Hypothesis Blueprint — a structured thinking tool to',
+          'sharpen their thesis before they go out to validate it.',
+          'Be clear: this is not a validated spec. It reflects their best current thinking.',
+          'Invite them to proceed and remind them that validation is the critical next step.',
+        )
+      } else {
+        lines.push(
+          'Acknowledge the conversation warmly and tell the founder that Xenysis has',
+          'enough to generate their Opportunity Assessment and Startup Blueprint.',
+          'Invite them to proceed. If any supporting areas had low confidence, mention',
+          'them briefly as areas to revisit after seeing the initial analysis.',
+        )
+      }
 
       if (understanding.warnings.length > 0) {
         lines.push('', 'NOTE FOR YOUR CLOSING MESSAGE — mention these areas need follow-up:')
         for (const w of understanding.warnings) {
           lines.push(`  - ${CATEGORY_DISPLAY[w.category].label}: ${w.confidence}% confidence`)
         }
+      }
+
+      // v2.1 F5: If any categories were explicitly unvalidated at completion, name them.
+      // The blueprint will label these fields — tell the founder what to expect.
+      const gapsInBlueprint = understanding.gapsInBlueprint ?? []
+      if (gapsInBlueprint.length > 0) {
+        lines.push(
+          '',
+          'GAPS TO NAME IN YOUR CLOSING MESSAGE:',
+          'The following areas had no external validation. Tell the founder, warmly and transparently:',
+          ...gapsInBlueprint.map((cat) => `  - ${CATEGORY_DISPLAY[cat].label}: marked as hypothesis in the blueprint`),
+          '',
+          'Example framing: "A few areas — [X] and [Y] — are based on your hypothesis',
+          'since you haven\'t validated them yet. The blueprint will label those sections',
+          'clearly so you know exactly where to focus your validation work."',
+          'Do NOT apologize or frame this as a deficiency — it is useful, actionable transparency.',
+        )
       }
     } else if (understanding.questioningMode === 'gap_identification') {
       lines.push(
@@ -169,7 +245,21 @@ export function buildChatSystemPrompt(
       const categoryName = CATEGORY_DISPLAY[weakest].label
       const strengthLabel = EVIDENCE_STRENGTH_LEVELS[weakestState.evidenceStrength]
 
-      if (weakestState.validationStatus === 'explicitly_unvalidated') {
+      if (weakest === 'customer' && understanding.multiIcpDetected) {
+        // v2.1 F3: Multi-ICP / marketplace customer focus — shift from single ICP to beachhead.
+        lines.push(
+          '',
+          '--- FOCUS INSTRUCTION (MULTI-ICP / MARKETPLACE) ---',
+          'This is a dual-sided or multi-segment business. The founder has both a supply side and a demand side.',
+          `Customer understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
+          'Do NOT ask "who is your exact buyer" as if there is one answer.',
+          'Instead, focus on: which segment is the beachhead?',
+          'Ask the founder to identify which side or segment they are prioritizing first',
+          'and what their go-to-market motion looks like for that beachhead segment.',
+          'Example: "Given you have both [side A] and [side B], which do you acquire first,',
+          'and why does that sequencing matter to your business model?"',
+        )
+      } else if (weakestState.validationStatus === 'explicitly_unvalidated') {
         // Category has confirmed absence of external evidence — ask understanding questions only.
         lines.push(
           '',
@@ -288,6 +378,18 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
         additionalProperties: false,
       },
 
+      // ── v2.1 F3: Multi-ICP / marketplace detection ────────────────────────
+      // Set true ONLY for genuine two-sided marketplaces or dual-segment businesses
+      // where both sides have materially different pricing or service models.
+      // Do NOT set true for buyer/user splits, segment variations, or discovery uncertainty.
+      multi_icp_detected: { type: 'boolean' },
+
+      // ── v2.1 F4: Pivot detection ───────────────────────────────────────────
+      // Set true ONLY when a genuine mid-session direction change is detected — the
+      // founder explicitly shifts the core problem, target customer, or solution domain.
+      // Do NOT set true for scope refinement or added detail within the same thesis.
+      pivot_detected: { type: 'boolean' },
+
       // ── This revision: Per-category absence signal ────────────────────────
       // Classify whether the founder stated they lack external evidence for each category.
       // 'none'   = not discussed or founder provided positive information
@@ -317,6 +419,7 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
       'risks', 'key_insights', 'confidence_score',
       'category_confidence', 'category_evidence', 'category_evidence_strength',
       'category_absence_signals',
+      'multi_icp_detected', 'pivot_detected',
     ],
     additionalProperties: false,
   },
@@ -404,6 +507,32 @@ export function buildMemoryExtractionSystemPrompt(
     'Assign absence signals to the single most relevant category — do not spread one statement',
     'across multiple categories.',
     '',
+    '',
+    'MULTI-ICP / MARKETPLACE DETECTION (multi_icp_detected):',
+    'Set multi_icp_detected = true ONLY when the founder describes a genuine two-sided marketplace',
+    'or dual-segment business where BOTH sides have materially different pricing or service models.',
+    'Examples that qualify:',
+    '  - "We charge suppliers $X/month and buyers pay per transaction" ✓',
+    '  - "We serve hospitals AND patients with separate onboarding and pricing" ✓',
+    'Do NOT set true for:',
+    '  - Buyer/user split within the same segment (buyer ≠ user of the same product)',
+    '  - Segment variations (enterprise vs SMB — same side, different sizes)',
+    '  - Uncertainty about who the customer is ("I\'m not sure if it\'s HR or IT")',
+    '  - B2B2C where only one side pays',
+    'Default: false.',
+    '',
+    'PIVOT DETECTION (pivot_detected):',
+    'Set pivot_detected = true ONLY when a genuine mid-session direction change is detected.',
+    'A pivot changes the core problem domain, target customer, or solution category.',
+    'Examples that qualify:',
+    '  - Founder started with "B2B SaaS for law firms" and is now describing a B2C consumer app',
+    '  - Core problem shifts from "data entry waste" to "legal liability management"',
+    'Do NOT set true for:',
+    '  - Scope refinement ("actually it\'s mid-market, not enterprise")',
+    '  - Added detail or clarification within the same thesis',
+    '  - Normal conversation exploration of adjacent ideas',
+    'Default: false.',
+    '',
     `Startup: ${startupName}`,
   ]
 
@@ -418,6 +547,11 @@ export function buildMemoryExtractionSystemPrompt(
       'The following reflects what is already known. Earlier conversation is not fully shown.',
       'If a category is NOT discussed in the recent messages, OUTPUT ITS CURRENT SCORE unchanged.',
       'Only change a score when the recent conversation adds new evidence or a clear contradiction.',
+      '',
+      'PIVOT EXCEPTION: If pivot_detected = true this turn, you MAY reduce confidence scores',
+      'to reflect that the direction has genuinely changed. A real pivot invalidates prior',
+      'evidence in the pivoted categories. Apply judgment — only reduce scores for categories',
+      'directly affected by the direction change.',
       '',
       existingMemory.problem   ? `Known problem: ${existingMemory.problem}`   : '',
       existingMemory.customer  ? `Known customer: ${existingMemory.customer}` : '',
