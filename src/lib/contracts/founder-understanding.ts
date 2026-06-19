@@ -334,7 +334,15 @@ export function detectWeakestCategory(
     // supply_side is invisible to non-marketplace sessions.
     if (cat === 'supply_side' && !marketplaceDetected) continue
 
-    const basePriority = computeCategoryPriority(cat, categoryConfidence[cat] ?? 0)
+    // For marketplace sessions, supply_side is effectively required — boost its priority
+    // weight above all supporting categories (max importance 10 for competition) so it
+    // wins the priority race when competition/market are also unexplored at 0%.
+    // Without this boost, competition (10) and market (9) beat supply_side (9) at equal
+    // confidence, causing the engine to delay supply-side discovery until those are done.
+    const effectiveImportance = (cat === 'supply_side' && marketplaceDetected)
+      ? CATEGORY_IMPORTANCE[cat] + 2  // 11 — beats competition(10) and market(9) at low confidence
+      : CATEGORY_IMPORTANCE[cat]
+    const basePriority = (100 - (categoryConfidence[cat] ?? 0)) * effectiveImportance
     const recentCount  = Math.min(focusHistory.filter((h) => h === cat).length, 3)
     const coolMult     = COOLING_MULTIPLIERS[recentCount] ?? 1.0
     // Saturated categories get a near-zero multiplier — they are exhausted and should not

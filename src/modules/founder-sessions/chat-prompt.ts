@@ -44,7 +44,7 @@ export function buildChatSystemPrompt(
   marketplaceDetected?: boolean,
 ): string {
   const effectiveMarketplaceDetected = marketplaceDetected ?? understanding.marketplaceDetected
-  const lines: string[] = [
+  const lines: (string | undefined)[] = [
     'You are an experienced startup advisor and AI Technical Cofounder.',
     'Your role is to deeply understand the startup through investigative conversation.',
     '',
@@ -269,18 +269,26 @@ export function buildChatSystemPrompt(
 
       if (weakest === 'supply_side' && effectiveMarketplaceDetected) {
         // v2.2 PR3: Supply-side is the weakest category for a marketplace — probe provider dynamics.
+        const supplySideIsGap = weakestState.validationStatus === 'explicitly_unvalidated'
         lines.push(
           '',
           '--- FOCUS INSTRUCTION (SUPPLY SIDE) ---',
-          'This marketplace startup has not yet explored its supply side.',
+          supplySideIsGap
+            ? 'This marketplace founder has confirmed they have NOT yet spoken with any supply-side participants.'
+            : 'This marketplace startup has not yet explored its supply side.',
           `Supply Side understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
           'The supply side = the independent providers, sellers, hosts, or drivers who create value on the platform.',
+          supplySideIsGap
+            ? 'Ask an UNDERSTANDING-SEEKING question — do NOT ask for validation evidence they confirmed they do not have.'
+            : undefined,
           'Your next question MUST investigate one of:',
-          '  - How does the startup recruit supply-side participants? (GTM for supply)',
-          '  - What makes supply-side participants choose this platform over alternatives?',
-          '  - How does the startup ensure supply quality? (screening, rating, or curation)',
-          '  - What is the supply-side retention strategy?',
-          'Do NOT conflate supply-side with the demand-side (buyers/users) in your question.',
+          '  - How does the startup plan to recruit supply-side participants? (GTM for supply)',
+          '  - What makes supply-side participants choose this platform over going direct?',
+          '  - How does the startup plan to ensure supply quality? (screening, rating, or curation)',
+          '  - What is the supply-side onboarding or retention strategy?',
+          supplySideIsGap
+            ? 'Frame your question as: "Who do you believe...", "What do you expect...", or "How do you plan to..."'
+            : 'Do NOT conflate supply-side with the demand-side (buyers/users) in your question.',
           'Example: "How do you plan to bring on your first [providers/sellers/hosts] — ',
           'what makes them want to list on your platform over just going direct?"',
         )
