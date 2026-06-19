@@ -270,28 +270,49 @@ export function buildChatSystemPrompt(
       if (weakest === 'supply_side' && effectiveMarketplaceDetected) {
         // v2.2 PR3: Supply-side is the weakest category for a marketplace — probe provider dynamics.
         const supplySideIsGap = weakestState.validationStatus === 'explicitly_unvalidated'
-        lines.push(
-          '',
-          '--- FOCUS INSTRUCTION (SUPPLY SIDE) ---',
-          supplySideIsGap
-            ? 'This marketplace founder has confirmed they have NOT yet spoken with any supply-side participants.'
-            : 'This marketplace startup has not yet explored its supply side.',
-          `Supply Side understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
-          'The supply side = the independent providers, sellers, hosts, or drivers who create value on the platform.',
-          supplySideIsGap
-            ? 'Ask an UNDERSTANDING-SEEKING question — do NOT ask for validation evidence they confirmed they do not have.'
-            : undefined,
-          'Your next question MUST investigate one of:',
-          '  - How does the startup plan to recruit supply-side participants? (GTM for supply)',
-          '  - What makes supply-side participants choose this platform over going direct?',
-          '  - How does the startup plan to ensure supply quality? (screening, rating, or curation)',
-          '  - What is the supply-side onboarding or retention strategy?',
-          supplySideIsGap
-            ? 'Frame your question as: "Who do you believe...", "What do you expect...", or "How do you plan to..."'
-            : 'Do NOT conflate supply-side with the demand-side (buyers/users) in your question.',
-          'Example: "How do you plan to bring on your first [providers/sellers/hosts] — ',
-          'what makes them want to list on your platform over just going direct?"',
-        )
+        // When the founder has given 2+ low-delta assumption turns for an unvalidated supply side,
+        // further assumption-gathering yields no new evidence. Pivot to validation planning.
+        const assumptionSaturated = supplySideIsGap && weakestState.saturationCount >= 2
+
+        if (assumptionSaturated) {
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION (SUPPLY SIDE — VALIDATION PLANNING) ---',
+            'This marketplace founder has confirmed they have not spoken with supply-side participants and has shared their best assumptions.',
+            'Do NOT ask more questions about supply-side pain points, motivations, or incentives.',
+            'All further questions in that direction generate speculation, not evidence.',
+            'Pivot to validation planning. Ask exactly ONE of the following:',
+            '  - "How would you go about validating whether [specific supply-side assumption] is actually true?"',
+            '  - "What evidence would most change your confidence in your assumptions about the supply side?"',
+            '  - "What is the fastest experiment you could run to test whether providers face the problems you expect?"',
+            '  - "What is the biggest risk to your model if your assumptions about the supply side turn out to be wrong?"',
+            'The goal is to move from assumption-collection into validation planning.',
+            'Do NOT ask for more beliefs, expectations, or hypotheses about supply-side dynamics.',
+          )
+        } else {
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION (SUPPLY SIDE) ---',
+            supplySideIsGap
+              ? 'This marketplace founder has confirmed they have NOT yet spoken with any supply-side participants.'
+              : 'This marketplace startup has not yet explored its supply side.',
+            `Supply Side understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
+            'The supply side = the independent providers, sellers, hosts, or drivers who create value on the platform.',
+            supplySideIsGap
+              ? 'Ask an UNDERSTANDING-SEEKING question — do NOT ask for validation evidence they confirmed they do not have.'
+              : undefined,
+            'Your next question MUST investigate one of:',
+            '  - How does the startup plan to recruit supply-side participants? (GTM for supply)',
+            '  - What makes supply-side participants choose this platform over going direct?',
+            '  - How does the startup plan to ensure supply quality? (screening, rating, or curation)',
+            '  - What is the supply-side onboarding or retention strategy?',
+            supplySideIsGap
+              ? 'Frame your question as: "Who do you believe...", "What do you expect...", or "How do you plan to..."'
+              : 'Do NOT conflate supply-side with the demand-side (buyers/users) in your question.',
+            'Example: "How do you plan to bring on your first [providers/sellers/hosts] — ',
+            'what makes them want to list on your platform over just going direct?"',
+          )
+        }
       } else if (weakest === 'customer' && understanding.multiIcpDetected) {
         // v2.1 F3: Multi-ICP / marketplace customer focus — shift from single ICP to beachhead.
         lines.push(
@@ -307,19 +328,36 @@ export function buildChatSystemPrompt(
           'and why does that sequencing matter to your business model?"',
         )
       } else if (weakestState.validationStatus === 'explicitly_unvalidated') {
-        // Category has confirmed absence of external evidence — ask understanding questions only.
-        lines.push(
-          '',
-          '--- FOCUS INSTRUCTION ---',
-          `${categoryName} has no external evidence yet — the founder confirmed this.`,
-          'Ask an UNDERSTANDING-SEEKING question only. DO NOT ask for validation, research, or customer data.',
-          'Frame your question around what the founder BELIEVES or HYPOTHESIZES:',
-          '  - What they expect to find when they do validate',
-          '  - Their mental model or reasoning about this area',
-          '  - Their assumptions or best-guess about the answer',
-          `Focus area: ${focusGuide}`,
-          'Example framing: "Who do you believe..." / "Why do you think..." / "What would you expect..."',
-        )
+        // When the founder has given 2+ low-delta assumption turns for this unvalidated category,
+        // further assumption-gathering yields no new evidence. Pivot to validation planning.
+        if (weakestState.saturationCount >= 2) {
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION (VALIDATION PLANNING) ---',
+            `${categoryName} has no external evidence yet and the founder has shared their best assumptions across multiple turns.`,
+            'Do NOT ask for more beliefs, expectations, or hypotheses in this area.',
+            'Pivot to validation planning. Ask exactly ONE of:',
+            '  - "How would you validate your assumption about [specific belief from the conversation]?"',
+            '  - "What evidence would most change your confidence in what you believe about [topic]?"',
+            '  - "What is the fastest experiment you could run to test whether this is true?"',
+            '  - "What is the biggest risk to your startup if this assumption turns out to be wrong?"',
+            'The goal is to shift from assumption-collection into evidence generation and risk awareness.',
+          )
+        } else {
+          // Category has confirmed absence of external evidence — ask understanding questions only.
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION ---',
+            `${categoryName} has no external evidence yet — the founder confirmed this.`,
+            'Ask an UNDERSTANDING-SEEKING question only. DO NOT ask for validation, research, or customer data.',
+            'Frame your question around what the founder BELIEVES or HYPOTHESIZES:',
+            '  - What they expect to find when they do validate',
+            '  - Their mental model or reasoning about this area',
+            '  - Their assumptions or best-guess about the answer',
+            `Focus area: ${focusGuide}`,
+            'Example framing: "Who do you believe..." / "Why do you think..." / "What would you expect..."',
+          )
+        }
       } else {
         lines.push(
           '',
