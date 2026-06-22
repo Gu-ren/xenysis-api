@@ -87,8 +87,8 @@ export class BlueprintGenerationService {
         startupId,
         type:          'blueprint',
         status:        'pending',
-        model:         'claude-sonnet-4-6',
-        provider:      'anthropic',
+        model:         'gpt-4o',
+        provider:      'openai',
         promptVersion: PROMPT_VERSION,
       })
       .returning()

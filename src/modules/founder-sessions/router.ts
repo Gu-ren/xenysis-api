@@ -294,6 +294,28 @@ founderSessionsRouter.post(
     // v2.2 PR2: pass session-level marketplaceDetected so first-turn prompt is platform-aware
     // even before a founder_understanding row exists.
     const sessionMarketplaceDetected = session.marketplaceDetected || currentUnderstanding.marketplaceDetected
+
+    // [TEMP DEBUG] supply_side state read from DB before prompt generation
+    const _dbSS = currentUnderstanding.categories?.supply_side
+    if (_dbSS) {
+      console.log('[DEBUG router pre-prompt] supply_side:', {
+        confidence:                  _dbSS.confidence,
+        validationStatus:            _dbSS.validationStatus,
+        saturationCount:             _dbSS.saturationCount,
+        validationPlanningCompleted: _dbSS.validationPlanningCompleted,
+        lastFocusConfidence:         _dbSS.lastFocusConfidence,
+      })
+      console.log('[DEBUG router pre-prompt] weakestCategory:', currentUnderstanding.weakestCategory)
+      // validationPlanningCandidate is a local in buildChatSystemPrompt — derive it here for debug visibility
+      const _dbVPCandidate = currentUnderstanding.categories
+        ? Object.entries(currentUnderstanding.categories).find(([cat, s]) => {
+            if (cat === 'supply_side' && !sessionMarketplaceDetected) return false
+            return s.validationStatus === 'explicitly_unvalidated' && s.saturationCount >= 1 && !s.validationPlanningCompleted
+          })?.[0] ?? null
+        : null
+      console.log('[DEBUG router pre-prompt] validationPlanningCandidate:', _dbVPCandidate)
+    }
+
     const systemPrompt = buildChatSystemPrompt(
       startup,
       latestSummary,

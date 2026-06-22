@@ -69,6 +69,23 @@ const CategoryAbsenceSignalsSchema = z.object({
 })
 export type CategoryAbsenceSignals = z.infer<typeof CategoryAbsenceSignalsSchema>
 
+// v2.2 PR3 — external-contact separation.
+// Per-turn boolean per category: true only when founder explicitly stated direct external contact
+// this turn. Stickiness (one-way latch) is enforced in the understanding engine via OR with
+// the existing value — memory always carries the current turn's raw LLM output.
+const CategoryHasExternalContactSchema = z.object({
+  problem:     z.boolean().default(false),
+  customer:    z.boolean().default(false),
+  solution:    z.boolean().default(false),
+  market:      z.boolean().default(false),
+  pricing:     z.boolean().default(false),
+  competition: z.boolean().default(false),
+  risks:       z.boolean().default(false),
+  founder_fit: z.boolean().default(false),
+  supply_side: z.boolean().default(false),
+})
+export type CategoryHasExternalContact = z.infer<typeof CategoryHasExternalContactSchema>
+
 // Incrementally merged startup intelligence — the primary input for OpportunityAgent (Sprint 3).
 // Fields are extracted from conversation and merged (not overwritten) after each AI exchange.
 //
@@ -153,6 +170,21 @@ export const FounderMemorySchema = z.object({
     risks:       'none',
     founder_fit: 'none',
     supply_side: 'none',
+  }),
+
+  // v2.2 PR3: per-turn boolean per category — replace-with-latest.
+  // True only when the founder explicitly stated direct external contact THIS TURN.
+  // Stickiness is enforced in the understanding engine (existingContact || thisContact).
+  category_has_external_contact: CategoryHasExternalContactSchema.default({
+    problem:     false,
+    customer:    false,
+    solution:    false,
+    market:      false,
+    pricing:     false,
+    competition: false,
+    risks:       false,
+    founder_fit: false,
+    supply_side: false,
   }),
 
   // v2.1 F3: replace-with-latest per turn. True only for genuine two-sided marketplaces
@@ -298,6 +330,16 @@ export function mergeFounderMemory(
     merged.category_absence_signals = {
       ...existing.category_absence_signals,
       ...extracted.category_absence_signals,
+    }
+  }
+
+  // v2.2 PR3: replace-with-latest per-turn boolean. Stickiness is enforced in the understanding
+  // engine — here we simply carry the current turn's LLM output, spreading so that categories
+  // not mentioned this turn retain their prior value.
+  if (extracted.category_has_external_contact) {
+    merged.category_has_external_contact = {
+      ...existing.category_has_external_contact,
+      ...extracted.category_has_external_contact,
     }
   }
 

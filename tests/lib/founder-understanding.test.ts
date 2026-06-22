@@ -334,7 +334,7 @@ describe('buildUnderstanding — gapsInBlueprint', () => {
   })
 
   it('captures explicitly_unvalidated categories at completion', () => {
-    // Gap categories (market, pricing) need strength<3 to stay explicitly_unvalidated.
+    // Gap categories (market, pricing) stay explicitly_unvalidated when hasExternalContact=false (default).
     // Required categories (problem, customer, solution) need strength-3 (ceiling 83 ≥ 80) to complete.
     const result = buildUnderstanding({
       ...minimalUnderstandingParams(THRESHOLD_COMPLETE),
@@ -367,7 +367,7 @@ describe('buildUnderstanding — gapsInBlueprint', () => {
   it('captures required categories in gapsInBlueprint when explicitly_unvalidated at completion (idea stage)', () => {
     // v2.2: building-stage required categories cannot be explicitly_unvalidated at completion
     // because the completion gate blocks them (strength<3 ceiling < threshold 80).
-    // Idea stage (threshold 60): strength-2 ceiling=65 ≥ 60, and strength<3 preserves explicitly_unvalidated.
+    // Idea stage (threshold 60): strength-2 ceiling=65 ≥ 60, and hasExternalContact=false preserves explicitly_unvalidated.
     const result = buildUnderstanding({
       ...minimalUnderstandingParams(THRESHOLD_HYPOTHESIS, 2),
       founderStage:        'idea',
@@ -408,7 +408,7 @@ describe('buildUnderstanding — gapsInBlueprint', () => {
 
   it('idea-stage hypothesis completion populates gapsInBlueprint correctly', () => {
     // strength-2: ceiling=65 ≥ 60 (idea threshold) — allows completion.
-    // strength<3 preserves explicitly_unvalidated status (not reverted by promoteValidationStatus).
+    // hasExternalContact=false (default) preserves explicitly_unvalidated (not reverted by promoteValidationStatus).
     const result = buildUnderstanding({
       ...minimalUnderstandingParams(THRESHOLD_HYPOTHESIS, 2),
       founderStage:        'idea',

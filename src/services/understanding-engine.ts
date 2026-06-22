@@ -101,8 +101,19 @@ export async function updateUnderstanding(
     UNDERSTANDING_CATEGORIES.map((cat) => [cat, existingUnderstanding.categories[cat].lastFocusConfidence ?? 0]),
   ) as Record<UnderstandingCategory, number>
 
+  const existingValidationPlanningCompleted = Object.fromEntries(
+    UNDERSTANDING_CATEGORIES.map((cat) => [cat, existingUnderstanding.categories[cat].validationPlanningCompleted ?? false]),
+  ) as Record<UnderstandingCategory, boolean>
+
   // Absence signals from the current turn's extraction (replace-with-latest in merged memory).
   const absenceSignals = (memory.category_absence_signals ?? {}) as Record<UnderstandingCategory, AbsenceSignalStrength>
+
+  // v2.2 PR3: external-contact one-way latch. Existing values come from stored understanding;
+  // this-turn values come from the current merged memory extraction.
+  const existingHasExternalContact = Object.fromEntries(
+    UNDERSTANDING_CATEGORIES.map((cat) => [cat, existingUnderstanding.categories[cat].hasExternalContact ?? false]),
+  ) as Record<UnderstandingCategory, boolean>
+  const hasExternalContactThisTurn = (memory.category_has_external_contact ?? {}) as Record<UnderstandingCategory, boolean>
 
   // Focus cooling: build history by prepending the previous weakestCategory.
   // This tells detectWeakestCategory which categories were recently targeted so it
@@ -139,13 +150,34 @@ export async function updateUnderstanding(
     existingWeakAbsenceCounts,
     existingSaturationCounts,
     existingLastFocusConfidence,
+    existingValidationPlanningCompleted,
     founderStage,
     maxEvidenceStrength: overallEvidenceStrength,
     multiIcpDetected,
     marketplaceDetected,
     pivotDetected,
     existingPivotCount,
+    existingHasExternalContact,
+    hasExternalContactThisTurn,
   })
+
+  // [TEMP DEBUG] supply_side state after buildUnderstanding
+  const _ss = understanding.categories.supply_side
+  console.log('[DEBUG buildUnderstanding] supply_side:', {
+    confidence:                  _ss.confidence,
+    validationStatus:            _ss.validationStatus,
+    saturationCount:             _ss.saturationCount,
+    validationPlanningCompleted: _ss.validationPlanningCompleted,
+    lastFocusConfidence:         _ss.lastFocusConfidence,
+  })
+  console.log('[DEBUG buildUnderstanding] weakestCategory:', understanding.weakestCategory)
+  // validationPlanningCandidate is computed inside buildChatSystemPrompt — derive it here for debug visibility
+  const _vpCandidate = UNDERSTANDING_CATEGORIES.find((cat) => {
+    if (cat === 'supply_side' && !understanding.marketplaceDetected) return false
+    const s = understanding.categories[cat]
+    return s.validationStatus === 'explicitly_unvalidated' && s.saturationCount >= 1 && !s.validationPlanningCompleted
+  }) ?? null
+  console.log('[DEBUG buildUnderstanding] validationPlanningCandidate:', _vpCandidate)
 
   // v2.2: Minimum-exchange gate — prevent completion on narrative coherence alone.
   // Stage-specific thresholds: revenue founders have paying-customer data and can

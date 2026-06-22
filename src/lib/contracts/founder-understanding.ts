@@ -7,7 +7,8 @@ export const UNDERSTANDING_SCHEMA_VERSION = '1.1' as const
 //   unknown:                Category not yet discussed or no absence signal.
 //   explicitly_unvalidated: Founder confirmed no external evidence exists.
 //                           Engine stops asking for validation; may still ask understanding questions.
-//   validated:              External signal exists (evidenceStrength >= 3).
+//   validated:              Founder explicitly stated direct external contact (hasExternalContact=true).
+//                           Driven by category_has_external_contact in extraction, NOT by evidenceStrength.
 export const ValidationStatusSchema = z.enum(['unknown', 'validated', 'explicitly_unvalidated'])
 export type ValidationStatus = z.infer<typeof ValidationStatusSchema>
 
@@ -21,11 +22,11 @@ export type AbsenceSignalStrength = z.infer<typeof AbsenceSignalSchema>
 
 // ── Assessment tier ───────────────────────────────────────────────────────────
 // Derived at read-time for the Opportunity Assessment layer — NOT persisted as stored state.
-// Computed by deriveAssessmentTier() from validationStatus + confidence + evidenceStrength.
+// Computed by deriveAssessmentTier() from validationStatus + confidence only.
 //   unknown:          Category not yet discussed.
 //   gap:              Explicitly unvalidated with low confidence (no hypothesis formed).
 //   assumption_based: Explicitly unvalidated but founder has a detailed theory (confidence >= 40).
-//   validated:        External evidence exists (evidenceStrength >= 3).
+//   validated:        Founder confirmed direct external contact (validationStatus = 'validated').
 export const AssessmentTierSchema = z.enum(['unknown', 'gap', 'assumption_based', 'validated'])
 export type AssessmentTier = z.infer<typeof AssessmentTierSchema>
 
@@ -179,6 +180,13 @@ export const CategoryStateSchema = z.object({
   weakAbsenceCount:    z.number().int().min(0).default(0),  // turns with 'weak' absence signal
   saturationCount:     z.number().int().min(0).default(0),  // turns focused with delta < SATURATION_DELTA_THRESHOLD
   lastFocusConfidence: z.number().int().min(0).max(100).default(0),  // confidence when last targeted
+  // One-way latch: true after the first turn where the validation-planning prompt fired for this category.
+  // Prevents the pre-scan from re-triggering validation planning on subsequent turns.
+  validationPlanningCompleted: z.boolean().default(false),
+  // One-way latch: true when the founder explicitly stated direct external contact for this category.
+  // Set by category_has_external_contact in extraction. Once true, stays true for the session.
+  // This is the ONLY signal that drives validationStatus → 'validated'. evidenceStrength does not.
+  hasExternalContact: z.boolean().default(false),
 
   // Assessment tier — computed by buildUnderstanding(), stored for consumers (not extracted).
   assessmentTier: AssessmentTierSchema.default('unknown'),
@@ -417,30 +425,35 @@ export function buildCompletionWarnings(
 
 // ── Validation gap pure functions ─────────────────────────────────────────────
 
-// Promote a category's validationStatus based on this turn's absence signal and
-// accumulated weak count. Called once per category per turn inside buildUnderstanding().
+// Promote a category's validationStatus based on the explicit external-contact signal,
+// this turn's absence signal, and accumulated weak count.
+// Called once per category per turn inside buildUnderstanding().
 //
 // Rules:
-//   External evidence always wins → validated (regardless of absence signal).
+//   hasExternalContact=true → validated (founder explicitly stated direct external contact).
+//   hasExternalContact arriving on an already-gap category reverts it to unknown (re-opens).
 //   Strong absence signal → immediately explicitly_unvalidated (no accumulation required).
 //   Weak absence (newWeakCount = already-incremented-for-this-turn) >= 2 → explicitly_unvalidated.
-//   External evidence arriving on an already-gap category reverts it to unknown (re-opens).
+//
+// NOTE: evidenceStrength is intentionally NOT used here. Evidence quality (strength) drives
+// completion gating and OA scoring — it is not a proxy for external validation contact.
+// A detailed founder hypothesis can score strength=3 without any real customer contact.
 export function promoteValidationStatus(
-  current:          ValidationStatus,
-  absenceSignal:    AbsenceSignalStrength,
-  newWeakCount:     number,         // existingWeakCount + 1 if this turn is 'weak', else unchanged
-  evidenceStrength: EvidenceStrength,
+  current:            ValidationStatus,
+  absenceSignal:      AbsenceSignalStrength,
+  newWeakCount:       number,          // existingWeakCount + 1 if this turn is 'weak', else unchanged
+  hasExternalContact: boolean,         // one-way latch: true only when founder explicitly stated contact
 ): ValidationStatus {
-  // External evidence overrides all absence signals.
-  if (evidenceStrength >= 3) {
-    // Revert a gap to unknown if new external evidence arrives — re-opens the category.
+  // Explicit external contact overrides all absence signals.
+  if (hasExternalContact) {
+    // Revert a gap to unknown if contact is now confirmed — re-opens the category for further probing.
     return current === 'explicitly_unvalidated' ? 'unknown' : 'validated'
   }
-  // Already validated — stays validated until external evidence disappears (can't happen in practice).
+  // Already validated via prior contact — stays validated (one-way latch).
   if (current === 'validated') return 'validated'
-  // Already a confirmed gap — stays unless external evidence reverted it above.
+  // Already a confirmed gap — stays unless contact reverted it above.
   if (current === 'explicitly_unvalidated') return 'explicitly_unvalidated'
-  // Strong signal → immediate promotion.
+  // Strong absence signal → immediate gap.
   if (absenceSignal === 'strong') return 'explicitly_unvalidated'
   // Weak accumulation threshold.
   if (newWeakCount >= 2) return 'explicitly_unvalidated'
@@ -452,9 +465,8 @@ export function promoteValidationStatus(
 export function deriveAssessmentTier(
   validationStatus: ValidationStatus,
   confidence:       number,
-  evidenceStrength: EvidenceStrength,
 ): AssessmentTier {
-  if (validationStatus === 'validated' || evidenceStrength >= 3) return 'validated'
+  if (validationStatus === 'validated') return 'validated'
   if (validationStatus === 'explicitly_unvalidated') {
     return confidence >= 40 ? 'assumption_based' : 'gap'
   }
@@ -505,9 +517,10 @@ export function buildUnderstanding(params: {
   // Validation gap params (default to empty maps for backward compatibility):
   absenceSignals?:              Record<UnderstandingCategory, AbsenceSignalStrength>
   existingValidationStatus?:    Record<UnderstandingCategory, ValidationStatus>
-  existingWeakAbsenceCounts?:   Record<UnderstandingCategory, number>
-  existingSaturationCounts?:    Record<UnderstandingCategory, number>
-  existingLastFocusConfidence?: Record<UnderstandingCategory, number>
+  existingWeakAbsenceCounts?:          Record<UnderstandingCategory, number>
+  existingSaturationCounts?:           Record<UnderstandingCategory, number>
+  existingLastFocusConfidence?:        Record<UnderstandingCategory, number>
+  existingValidationPlanningCompleted?: Record<UnderstandingCategory, boolean>
   // v2.1 F1+F2:
   founderStage?:        FounderStage
   maxEvidenceStrength?: EvidenceStrength
@@ -517,6 +530,9 @@ export function buildUnderstanding(params: {
   existingPivotCount?:  number
   // v2.2 PR2:
   marketplaceDetected?: boolean
+  // v2.2 PR3 — external-contact separation:
+  existingHasExternalContact?:  Record<UnderstandingCategory, boolean>
+  hasExternalContactThisTurn?:  Record<UnderstandingCategory, boolean>
 }): FounderUnderstanding {
   const {
     categoryConfidence,
@@ -526,15 +542,18 @@ export function buildUnderstanding(params: {
     focusHistory = [],
     absenceSignals             = {} as Record<UnderstandingCategory, AbsenceSignalStrength>,
     existingValidationStatus   = {} as Record<UnderstandingCategory, ValidationStatus>,
-    existingWeakAbsenceCounts  = {} as Record<UnderstandingCategory, number>,
-    existingSaturationCounts   = {} as Record<UnderstandingCategory, number>,
-    existingLastFocusConfidence = {} as Record<UnderstandingCategory, number>,
+    existingWeakAbsenceCounts            = {} as Record<UnderstandingCategory, number>,
+    existingSaturationCounts             = {} as Record<UnderstandingCategory, number>,
+    existingLastFocusConfidence          = {} as Record<UnderstandingCategory, number>,
+    existingValidationPlanningCompleted  = {} as Record<UnderstandingCategory, boolean>,
     founderStage        = 'building',
     maxEvidenceStrength = 1,
     multiIcpDetected    = false,
     pivotDetected       = false,
     existingPivotCount  = 0,
     marketplaceDetected = false,
+    existingHasExternalContact  = {} as Record<UnderstandingCategory, boolean>,
+    hasExternalContactThisTurn  = {} as Record<UnderstandingCategory, boolean>,
   } = params
 
   // The category at focusHistory[0] was the weakest last turn — used for saturation delta check.
@@ -569,8 +588,11 @@ export function buildUnderstanding(params: {
       // Increment weak absence count if this turn emitted a weak signal.
       const newWeakCount = signal === 'weak' ? existingWeak + 1 : existingWeak
 
-      // Validation status promotion.
-      const validationStatus = promoteValidationStatus(existingStatus, signal, newWeakCount, strength)
+      // One-way latch: hasExternalContact stays true once set (existing OR this turn).
+      const hasContact = (existingHasExternalContact[cat] ?? false) || (hasExternalContactThisTurn[cat] ?? false)
+
+      // Validation status promotion — driven by explicit external contact, not evidenceStrength.
+      const validationStatus = promoteValidationStatus(existingStatus, signal, newWeakCount, hasContact)
 
       // Saturation: increment when this category was targeted last turn and delta is small.
       const wasLastFocus    = lastFocusCat === cat
@@ -582,17 +604,27 @@ export function buildUnderstanding(params: {
 
       saturationCountsForDetect[cat] = newSatCount
 
+      // One-way latch: set true after the turn where the validation-planning prompt fired.
+      // The prompt fires when the PREVIOUS stored state had saturationCount >= 1 and
+      // validationStatus === 'explicitly_unvalidated'. We detect that here by reading
+      // existingSat and existingStatus (which are what the prompt read last turn).
+      const existingVPC = existingValidationPlanningCompleted[cat] ?? false
+      const newValidationPlanningCompleted = existingVPC
+        || (existingSat >= 1 && existingStatus === 'explicitly_unvalidated')
+
       return [cat, {
         confidence,
-        status:              confidenceToStatus(confidence),
-        evidenceCount:       merged.length,
-        evidence:            merged,
-        evidenceStrength:    strength,
+        status:                      confidenceToStatus(confidence),
+        evidenceCount:               merged.length,
+        evidence:                    merged,
+        evidenceStrength:            strength,
         validationStatus,
-        weakAbsenceCount:    newWeakCount,
-        saturationCount:     newSatCount,
-        lastFocusConfidence: newLastFocusConf,
-        assessmentTier:      deriveAssessmentTier(validationStatus, confidence, strength),
+        hasExternalContact:          hasContact,
+        weakAbsenceCount:            newWeakCount,
+        saturationCount:             newSatCount,
+        lastFocusConfidence:         newLastFocusConf,
+        validationPlanningCompleted: newValidationPlanningCompleted,
+        assessmentTier:              deriveAssessmentTier(validationStatus, confidence),
       }]
     }),
   ) as FounderUnderstanding['categories']
@@ -650,16 +682,18 @@ export function buildUnderstanding(params: {
 // ── Empty / default state ─────────────────────────────────────────────────────
 
 const EMPTY_CATEGORY_STATE: CategoryState = {
-  confidence:          0,
-  status:              'missing',
-  evidenceCount:       0,
-  evidence:            [],
-  evidenceStrength:    1,
-  validationStatus:    'unknown',
-  weakAbsenceCount:    0,
-  saturationCount:     0,
-  lastFocusConfidence: 0,
-  assessmentTier:      'unknown',
+  confidence:                  0,
+  status:                      'missing',
+  evidenceCount:               0,
+  evidence:                    [],
+  evidenceStrength:            1,
+  validationStatus:            'unknown',
+  weakAbsenceCount:            0,
+  saturationCount:             0,
+  lastFocusConfidence:         0,
+  validationPlanningCompleted: false,
+  hasExternalContact:          false,
+  assessmentTier:              'unknown',
 }
 
 export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
