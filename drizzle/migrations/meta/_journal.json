@@ -57,6 +57,13 @@
       "when": 1750291200000,
       "tag": "0007_supply_side",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1750377600000,
+      "tag": "0008_workspace_waitlist",
+      "breakpoints": true
     }
   ]
 }

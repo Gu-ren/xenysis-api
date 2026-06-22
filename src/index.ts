@@ -7,6 +7,7 @@ import { founderSessionsRouter } from './modules/founder-sessions/router.ts'
 import { blueprintRouter } from './modules/blueprint/router.ts'
 import { opportunityRouter } from './modules/opportunity/router.ts'
 import { startupsRouter } from './modules/startups/router.ts'
+import { waitlistRouter } from './modules/waitlist/router.ts'
 import { errorResponse } from './middleware/errors.ts'
 import type { HonoEnv } from './types/hono.ts'
 
@@ -44,6 +45,9 @@ v1.route('/startups', startupsRouter)
 v1.route('/startups', founderSessionsRouter)
 v1.route('/startups', opportunityRouter)
 v1.route('/startups', blueprintRouter)
+
+// Waitlist + admin
+v1.route('/waitlist', waitlistRouter)
 
 
 app.route('/api/v1', v1)

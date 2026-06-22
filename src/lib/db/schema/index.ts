@@ -24,6 +24,7 @@ export * from './sessions-intelligence.ts'
 export * from './understanding.ts'
 export * from './artifacts.ts'
 export * from './generation.ts'
+export * from './waitlist.ts'
 
 // ── Drizzle relations ─────────────────────────────────────────────────────────
 
