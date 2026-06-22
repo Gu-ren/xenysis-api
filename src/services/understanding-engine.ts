@@ -2,13 +2,16 @@ import { eq } from 'drizzle-orm'
 import type { DB as DrizzleDB } from '../lib/db/index.ts'
 import { evidenceRecords, founderUnderstanding } from '../lib/db/schema/understanding.ts'
 import type { FounderMemory } from '../lib/contracts/founder-memory.ts'
+import { logActivity } from '../agents/base/utils.ts'
 import {
   type FounderUnderstanding,
   type UnderstandingCategory,
   type EvidenceStrength,
   type ValidationStatus,
   type AbsenceSignalStrength,
+  type FounderStage,
   UNDERSTANDING_CATEGORIES,
+  SATURATION_THRESHOLD,
   buildUnderstanding,
   EMPTY_UNDERSTANDING,
   FounderUnderstandingSchema,
@@ -29,6 +32,12 @@ export interface UpdateUnderstandingParams {
   userId:          string
   memory:          FounderMemory
   sourceMessageId?: string
+  founderStage?:   FounderStage
+  // v2.2: used by the minimum-exchange gate to suppress completion until the session
+  // has enough depth. The router passes (session.messagesCount + 1) as the post-increment count.
+  messagesCount?:  number
+  // v2.2 PR2: seed from the session-init heuristic; OR'd with existing understanding for stickiness.
+  marketplaceDetected?: boolean
 }
 
 export interface UpdateUnderstandingResult {
@@ -50,7 +59,7 @@ export interface UpdateUnderstandingResult {
 export async function updateUnderstanding(
   params: UpdateUnderstandingParams,
 ): Promise<UpdateUnderstandingResult> {
-  const { db, sessionId, startupId, userId, memory, sourceMessageId } = params
+  const { db, sessionId, startupId, userId, memory, sourceMessageId, founderStage = 'building', messagesCount = 0, marketplaceDetected: seedMarketplaceDetected = false } = params
 
   // Load existing row to access accumulated evidence (never lost across turns).
   const existingRow = await db.query.founderUnderstanding.findFirst({
@@ -92,8 +101,19 @@ export async function updateUnderstanding(
     UNDERSTANDING_CATEGORIES.map((cat) => [cat, existingUnderstanding.categories[cat].lastFocusConfidence ?? 0]),
   ) as Record<UnderstandingCategory, number>
 
+  const existingValidationPlanningCompleted = Object.fromEntries(
+    UNDERSTANDING_CATEGORIES.map((cat) => [cat, existingUnderstanding.categories[cat].validationPlanningCompleted ?? false]),
+  ) as Record<UnderstandingCategory, boolean>
+
   // Absence signals from the current turn's extraction (replace-with-latest in merged memory).
   const absenceSignals = (memory.category_absence_signals ?? {}) as Record<UnderstandingCategory, AbsenceSignalStrength>
+
+  // v2.2 PR3: external-contact one-way latch. Existing values come from stored understanding;
+  // this-turn values come from the current merged memory extraction.
+  const existingHasExternalContact = Object.fromEntries(
+    UNDERSTANDING_CATEGORIES.map((cat) => [cat, existingUnderstanding.categories[cat].hasExternalContact ?? false]),
+  ) as Record<UnderstandingCategory, boolean>
+  const hasExternalContactThisTurn = (memory.category_has_external_contact ?? {}) as Record<UnderstandingCategory, boolean>
 
   // Focus cooling: build history by prepending the previous weakestCategory.
   // This tells detectWeakestCategory which categories were recently targeted so it
@@ -103,7 +123,23 @@ export async function updateUnderstanding(
     ? [existingUnderstanding.weakestCategory, ...existingFocusHistory].slice(0, 5)
     : existingFocusHistory
 
-  const understanding = buildUnderstanding({
+  // Compute overall evidence strength before buildUnderstanding so it can inform the threshold.
+  const overallEvidenceStrength = Math.max(
+    ...UNDERSTANDING_CATEGORIES.map((cat) => categoryStrength[cat] ?? 1),
+  ) as EvidenceStrength
+
+  // v2.1 F3: multiIcpDetected is sticky — once true it stays true across turns.
+  const multiIcpDetected = existingUnderstanding.multiIcpDetected || (memory.multi_icp_detected ?? false)
+
+  // v2.2 PR2: marketplaceDetected is sticky — once true it stays true across turns.
+  // Seeded at session creation by the heuristic; confirmed/corrected by LLM extraction each turn.
+  const marketplaceDetected = existingUnderstanding.marketplaceDetected || seedMarketplaceDetected || (memory.marketplace_detected ?? false)
+
+  // v2.1 F4: pivot_detected is per-turn (replace-with-latest from memory).
+  const pivotDetected    = memory.pivot_detected ?? false
+  const existingPivotCount = existingUnderstanding.pivotCount ?? 0
+
+  let understanding = buildUnderstanding({
     categoryConfidence:          memory.category_confidence,
     categoryEvidence:            memory.category_evidence,
     categoryStrength,
@@ -114,7 +150,70 @@ export async function updateUnderstanding(
     existingWeakAbsenceCounts,
     existingSaturationCounts,
     existingLastFocusConfidence,
+    existingValidationPlanningCompleted,
+    founderStage,
+    maxEvidenceStrength: overallEvidenceStrength,
+    multiIcpDetected,
+    marketplaceDetected,
+    pivotDetected,
+    existingPivotCount,
+    existingHasExternalContact,
+    hasExternalContactThisTurn,
   })
+
+  // [TEMP DEBUG] supply_side state after buildUnderstanding
+  const _ss = understanding.categories.supply_side
+  console.log('[DEBUG buildUnderstanding] supply_side:', {
+    confidence:                  _ss.confidence,
+    validationStatus:            _ss.validationStatus,
+    saturationCount:             _ss.saturationCount,
+    validationPlanningCompleted: _ss.validationPlanningCompleted,
+    lastFocusConfidence:         _ss.lastFocusConfidence,
+  })
+  console.log('[DEBUG buildUnderstanding] weakestCategory:', understanding.weakestCategory)
+  // validationPlanningCandidate is computed inside buildChatSystemPrompt — derive it here for debug visibility
+  const _vpCandidate = UNDERSTANDING_CATEGORIES.find((cat) => {
+    if (cat === 'supply_side' && !understanding.marketplaceDetected) return false
+    const s = understanding.categories[cat]
+    return s.validationStatus === 'explicitly_unvalidated' && s.saturationCount >= 1 && !s.validationPlanningCompleted
+  }) ?? null
+  console.log('[DEBUG buildUnderstanding] validationPlanningCandidate:', _vpCandidate)
+
+  // v2.2: Minimum-exchange gate — prevent completion on narrative coherence alone.
+  // Stage-specific thresholds: revenue founders have paying-customer data and can
+  // establish quality evidence faster; idea/building founders need more exploration depth.
+  // These defaults are tunable via environment variables without redeployment.
+  const MIN_EXCHANGES: Record<FounderStage, number> = {
+    idea:     Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_IDEA     ?? 6),
+    building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 8),
+    revenue:  Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_REVENUE  ?? 6),
+  }
+  if (understanding.isComplete && messagesCount < MIN_EXCHANGES[founderStage]) {
+    // Suppress completion: clear all completion-specific fields so the front-end
+    // does not transition to the complete state prematurely. Confidence scores,
+    // evidence, and saturation state are preserved — only the completion signal
+    // is held back until the exchange floor is met.
+    understanding = {
+      ...understanding,
+      isComplete:       false,
+      warnings:         [],
+      gapsInBlueprint:  [],
+      completionReason: undefined,
+    }
+  }
+
+  // Beta early-exit eligibility — secondary path that surfaces a founder-facing choice when
+  // Xenysis has foundational understanding but the session has not yet naturally completed.
+  // Criteria: required categories at partial confidence + overall floor + exchange minimum.
+  const earlyExitEligible = (
+    !understanding.isComplete &&
+    understanding.categories.problem.confidence  >= 50 &&
+    understanding.categories.customer.confidence >= 50 &&
+    understanding.categories.solution.confidence >= 50 &&
+    understanding.overallConfidence >= 70 &&
+    messagesCount >= MIN_EXCHANGES[founderStage]
+  )
+  understanding = { ...understanding, earlyExitEligible }
 
   // Determine evidence items that are new this turn.
   const newEvidenceByCategory: Partial<Record<UnderstandingCategory, string[]>> = {}
@@ -124,11 +223,6 @@ export async function updateUnderstanding(
     const newItems         = incoming.filter((item) => !alreadyPersisted.has(item))
     if (newItems.length > 0) newEvidenceByCategory[cat] = newItems
   }
-
-  // Compute overall evidence strength: maximum across all categories.
-  const overallEvidenceStrength = Math.max(
-    ...UNDERSTANDING_CATEGORIES.map((cat) => categoryStrength[cat] ?? 1),
-  ) as EvidenceStrength
 
   // Upsert founder_understanding.
   const upsertPayload = {
@@ -143,10 +237,12 @@ export async function updateUnderstanding(
     competitionConfidence:  understanding.categories.competition.confidence,
     risksConfidence:        understanding.categories.risks.confidence,
     founderFitConfidence:   understanding.categories.founder_fit.confidence,    // Revision 2
+    supplySideConfidence:   understanding.categories.supply_side.confidence,    // v2.2 PR3
     overallConfidence:      understanding.overallConfidence,
     overallEvidenceStrength,                                                    // Revision 3
     isComplete:             understanding.isComplete,
     weakestCategory:        understanding.weakestCategory,
+    marketplaceDetected:    understanding.marketplaceDetected,
     understanding,
     updatedAt:              new Date(),
   }
@@ -217,6 +313,86 @@ export async function updateUnderstanding(
   if (evidenceInserts.length > 0) {
     await db.insert(evidenceRecords).values(evidenceInserts)
   }
+
+  // v2.1 instrumentation — transition-guarded, fire-and-forget.
+  const prevIsComplete      = existingUnderstanding.isComplete
+  const prevQuestioningMode = existingUnderstanding.questioningMode
+
+  const instrumentationEvents: Promise<void>[] = []
+
+  if (!prevIsComplete && understanding.isComplete) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.completion_threshold_reached',
+      description: `Session understanding complete for session ${sessionId}`,
+      meta:        { sessionId, founderStage, blueprintMode: understanding.blueprintMode, overallConfidence: understanding.overallConfidence },
+    }))
+  }
+
+  if (prevQuestioningMode !== 'gap_identification' && understanding.questioningMode === 'gap_identification') {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.gap_identification_entered',
+      description: `Questioning mode shifted to gap_identification for session ${sessionId}`,
+      meta:        { sessionId },
+    }))
+  }
+
+  for (const cat of UNDERSTANDING_CATEGORIES) {
+    const prevSat = existingUnderstanding.categories[cat].saturationCount ?? 0
+    const newSat  = understanding.categories[cat].saturationCount
+    if (prevSat < SATURATION_THRESHOLD && newSat >= SATURATION_THRESHOLD) {
+      instrumentationEvents.push(logActivity(db, {
+        userId, startupId,
+        type:        'understanding.category_saturated',
+        description: `Category ${cat} reached saturation for session ${sessionId}`,
+        meta:        { sessionId, category: cat, confidence: understanding.categories[cat].confidence },
+      }))
+    }
+
+    const prevStatus = existingUnderstanding.categories[cat].validationStatus
+    const newStatus  = understanding.categories[cat].validationStatus
+    if (prevStatus !== 'explicitly_unvalidated' && newStatus === 'explicitly_unvalidated') {
+      instrumentationEvents.push(logActivity(db, {
+        userId, startupId,
+        type:        'understanding.gap_confirmed',
+        description: `Validation gap confirmed for category ${cat} in session ${sessionId}`,
+        meta:        { sessionId, category: cat },
+      }))
+    }
+  }
+
+  // v2.1 F3: fires once when multiIcpDetected transitions false → true.
+  if (!existingUnderstanding.multiIcpDetected && understanding.multiIcpDetected) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.multi_icp_detected',
+      description: `Multi-ICP / marketplace detected for session ${sessionId}`,
+      meta:        { sessionId },
+    }))
+  }
+
+  // v2.2 PR2: fires once when marketplaceDetected transitions false → true.
+  if (!existingUnderstanding.marketplaceDetected && understanding.marketplaceDetected) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.marketplace_detected',
+      description: `Marketplace platform detected for session ${sessionId}`,
+      meta:        { sessionId },
+    }))
+  }
+
+  // v2.1 F4: fires every turn where pivotDetected = true.
+  if (understanding.pivotDetected) {
+    instrumentationEvents.push(logActivity(db, {
+      userId, startupId,
+      type:        'understanding.pivot_detected',
+      description: `Pivot detected in session ${sessionId}`,
+      meta:        { sessionId, pivotCount: understanding.pivotCount },
+    }))
+  }
+
+  await Promise.allSettled(instrumentationEvents)
 
   return {
     understanding,

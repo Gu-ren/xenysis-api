@@ -13,8 +13,6 @@ import { founderSessions, sessionAnswers } from './founder-sessions.ts'
 import { founderMemories, sessionSummaries } from './sessions-intelligence.ts'
 import { founderUnderstanding, evidenceRecords } from './understanding.ts'
 import { generationJobs, aiUsageLog } from './generation.ts'
-import { deployEnvironments, deployEnvVars, releases } from './deploy.ts'
-import { activityLog } from './activity.ts'
 import { startups } from './startups.ts'
 
 // ── Active schema exports ─────────────────────────────────────────────────────
@@ -26,8 +24,7 @@ export * from './sessions-intelligence.ts'
 export * from './understanding.ts'
 export * from './artifacts.ts'
 export * from './generation.ts'
-export * from './deploy.ts'
-export * from './activity.ts'
+export * from './waitlist.ts'
 
 // ── Drizzle relations ─────────────────────────────────────────────────────────
 
@@ -36,8 +33,6 @@ export const startupsRelations = relations(startups, ({ many }) => ({
   opportunityAssessments: many(opportunityAssessments),
   blueprints:             many(blueprints),
   generationJobs:         many(generationJobs),
-  activityLog:            many(activityLog),
-  deployEnvironments:     many(deployEnvironments),
 }))
 
 export const founderSessionsRelations = relations(founderSessions, ({ one, many }) => ({
@@ -176,35 +171,5 @@ export const aiUsageLogRelations = relations(aiUsageLog, ({ one }) => ({
   job: one(generationJobs, {
     fields:     [aiUsageLog.generationJobId],
     references: [generationJobs.id],
-  }),
-}))
-
-export const deployEnvironmentsRelations = relations(deployEnvironments, ({ one, many }) => ({
-  startup: one(startups, {
-    fields:     [deployEnvironments.startupId],
-    references: [startups.id],
-  }),
-  envVars:  many(deployEnvVars),
-  releases: many(releases),
-}))
-
-export const deployEnvVarsRelations = relations(deployEnvVars, ({ one }) => ({
-  environment: one(deployEnvironments, {
-    fields:     [deployEnvVars.environmentId],
-    references: [deployEnvironments.id],
-  }),
-}))
-
-export const releasesRelations = relations(releases, ({ one }) => ({
-  environment: one(deployEnvironments, {
-    fields:     [releases.environmentId],
-    references: [deployEnvironments.id],
-  }),
-}))
-
-export const activityLogRelations = relations(activityLog, ({ one }) => ({
-  startup: one(startups, {
-    fields:     [activityLog.startupId],
-    references: [startups.id],
   }),
 }))

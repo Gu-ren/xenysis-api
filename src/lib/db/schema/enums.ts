@@ -67,19 +67,6 @@ export const aiProviderEnum = pgEnum('ai_provider', [
   'anthropic',
 ])
 
-export const releaseStatusEnum = pgEnum('release_status', [
-  'queued',
-  'in_progress',
-  'success',
-  'failed',
-])
-
-export const environmentNameEnum = pgEnum('environment_name', [
-  'production',
-  'staging',
-  'development',
-])
-
 // ── TypeScript union types inferred from drizzle enums ────────────────────────
 export type LifecycleStage      = typeof lifecycleStageEnum.enumValues[number]
 export type SessionStatus       = typeof sessionStatusEnum.enumValues[number]
@@ -89,5 +76,3 @@ export type GenerationJobType   = typeof generationJobTypeEnum.enumValues[number
 export type GenerationJobStatus = typeof generationJobStatusEnum.enumValues[number]
 export type AiPurpose           = typeof aiPurposeEnum.enumValues[number]
 export type AIProvider          = typeof aiProviderEnum.enumValues[number]
-export type ReleaseStatus       = typeof releaseStatusEnum.enumValues[number]
-export type EnvironmentName     = typeof environmentNameEnum.enumValues[number]

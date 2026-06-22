@@ -26,7 +26,9 @@ import { FounderMemorySchema, EMPTY_FOUNDER_MEMORY, mergeFounderMemory, type Fou
 import { SessionSummarySchema } from '../../lib/contracts/session-summary.ts'
 import {
   FounderUnderstandingSchema,
+  FounderStageSchema,
   EMPTY_UNDERSTANDING,
+  UNDERSTANDING_CATEGORIES,
 } from '../../lib/contracts/founder-understanding.ts'
 import { logActivity, trackUsage, estimateTokens, fromOpenAI } from '../../agents/base/utils.ts'
 import { updateUnderstanding, loadUnderstanding } from '../../services/understanding-engine.ts'
@@ -35,6 +37,29 @@ import type { HonoEnv } from '../../types/hono.ts'
 
 const MAX_SESSION_ANSWERS = Number(process.env.MAX_SESSION_ANSWERS ?? 100)
 const MAX_CHAT_MESSAGES_PER_SESSION = Number(process.env.MAX_CHAT_MESSAGES_PER_SESSION ?? 50)
+
+// ── v2.2 PR2: Session-init marketplace heuristic ──────────────────────────────
+// Conservative keyword/pattern check on the founder's idea text.
+// False negatives are acceptable — the LLM extraction catches cases the heuristic misses
+// and the sticky flag in the engine propagates the signal once either source fires.
+// False positives are tolerable (extra context in the prompt) but kept low by requiring
+// explicit platform-structure terms rather than generic "marketplace" mentions.
+function classifyMarketplaceFromIdea(idea: string): boolean {
+  const text = idea.toLowerCase()
+  return (
+    /\bmarketplace\b/.test(text)                              ||
+    /\btwo[- ]sided\b/.test(text)                             ||
+    /\bdual[- ]sided\b/.test(text)                            ||
+    /\b(buyers?\s+and\s+sellers?|sellers?\s+and\s+buyers?)\b/.test(text) ||
+    /\b(hosts?\s+and\s+guests?|guests?\s+and\s+hosts?)\b/.test(text)     ||
+    /\b(drivers?\s+and\s+riders?|riders?\s+and\s+drivers?)\b/.test(text) ||
+    /\bsupply[- ]side\b/.test(text)                           ||
+    /\bplatform\b.*\bconnect\w*\b/.test(text)                  ||
+    /\bconnect\w*\b.*\bplatform\b/.test(text)                  ||
+    /\bplatform\b.*\b(match(ing)?|link(ing)?)\b/.test(text)    ||
+    /\b(match(ing)?|link(ing)?)\b.*\bplatform\b/.test(text)
+  )
+}
 
 export const founderSessionsRouter = new Hono<HonoEnv>()
 
@@ -50,7 +75,8 @@ const sessionIdParam = z.object({
 })
 
 const createSessionBody = z.object({
-  idea: z.string().min(10, 'Idea must be at least 10 characters').max(2000),
+  idea:         z.string().min(10, 'Idea must be at least 10 characters').max(2000),
+  founderStage: z.enum(['idea', 'building', 'revenue']).default('building'),
 })
 
 const addAnswerBody = z.object({
@@ -97,9 +123,11 @@ founderSessionsRouter.post(
 
     const startup = await requireStartupOwner(startupId, userId)
 
+    const marketplaceDetected = classifyMarketplaceFromIdea(body.idea)
+
     const [session] = await db
       .insert(founderSessions)
-      .values({ startupId, userId, idea: body.idea, status: 'active' })
+      .values({ startupId, userId, idea: body.idea, status: 'active', founderStage: body.founderStage, marketplaceDetected })
       .returning()
 
     await logActivity(db, {
@@ -107,7 +135,7 @@ founderSessionsRouter.post(
       startupId,
       type:        'session.started',
       description: `Founder session started for "${startup.name}"`,
-      meta:        { sessionId: session.id },
+      meta:        { sessionId: session.id, founderStage: body.founderStage, marketplaceDetected },
     })
 
     return c.json({ data: session }, 201)
@@ -260,8 +288,42 @@ founderSessionsRouter.post(
       ? (FounderMemorySchema.safeParse(existingMemoryRow.memory).data ?? null)
       : null
 
-    // Sprint 2.5: system prompt is now gap-aware.
-    const systemPrompt = buildChatSystemPrompt(startup, latestSummary, currentUnderstanding)
+    const parsedStage = FounderStageSchema.safeParse(session.founderStage)
+    const sessionFounderStage = parsedStage.success ? parsedStage.data : 'building'
+
+    // Sprint 2.5 / v2.1: system prompt is gap-aware and stage-aware.
+    // v2.2 PR2: pass session-level marketplaceDetected so first-turn prompt is platform-aware
+    // even before a founder_understanding row exists.
+    const sessionMarketplaceDetected = session.marketplaceDetected || currentUnderstanding.marketplaceDetected
+
+    // [TEMP DEBUG] supply_side state read from DB before prompt generation
+    const _dbSS = currentUnderstanding.categories?.supply_side
+    if (_dbSS) {
+      console.log('[DEBUG router pre-prompt] supply_side:', {
+        confidence:                  _dbSS.confidence,
+        validationStatus:            _dbSS.validationStatus,
+        saturationCount:             _dbSS.saturationCount,
+        validationPlanningCompleted: _dbSS.validationPlanningCompleted,
+        lastFocusConfidence:         _dbSS.lastFocusConfidence,
+      })
+      console.log('[DEBUG router pre-prompt] weakestCategory:', currentUnderstanding.weakestCategory)
+      // validationPlanningCandidate is a local in buildChatSystemPrompt — derive it here for debug visibility
+      const _dbVPCandidate = currentUnderstanding.categories
+        ? Object.entries(currentUnderstanding.categories).find(([cat, s]) => {
+            if (cat === 'supply_side' && !sessionMarketplaceDetected) return false
+            return s.validationStatus === 'explicitly_unvalidated' && s.saturationCount >= 1 && !s.validationPlanningCompleted
+          })?.[0] ?? null
+        : null
+      console.log('[DEBUG router pre-prompt] validationPlanningCandidate:', _dbVPCandidate)
+    }
+
+    const systemPrompt = buildChatSystemPrompt(
+      startup,
+      latestSummary,
+      currentUnderstanding,
+      sessionFounderStage,
+      sessionMarketplaceDetected,
+    )
 
     // Reconstruct conversation history from session answers.
     const historyMessages: Array<{ role: 'user' | 'assistant'; content: string }> =
@@ -479,8 +541,11 @@ founderSessionsRouter.post(
                     sessionId,
                     startupId,
                     userId,
-                    memory:          merged,
-                    sourceMessageId: job.id,
+                    memory:               merged,
+                    sourceMessageId:      job.id,
+                    founderStage:         sessionFounderStage,
+                    messagesCount:        newCount,
+                    marketplaceDetected:  sessionMarketplaceDetected,
                   })
 
                   // 7. Close the session when understanding is complete.
@@ -497,6 +562,27 @@ founderSessionsRouter.post(
                         updatedAt:              new Date(),
                       })
                       .where(eq(founderSessions.id, sessionId))
+
+                    await logActivity(db, {
+                      userId,
+                      startupId,
+                      type:        'session.completed',
+                      description: `Founder session completed for startup ${startupId}`,
+                      meta: {
+                        sessionId,
+                        founderStage:        session.founderStage ?? 'building',
+                        blueprintMode:       understandingResult.understanding.blueprintMode,
+                        overallConfidence:   understandingResult.overallConfidence,
+                        messagesCount:       session.messagesCount + 1,
+                        durationSeconds,
+                        gapsInBlueprint:     understandingResult.understanding.gapsInBlueprint,
+                        requiredConfidence: {
+                          problem:  understandingResult.understanding.categories.problem.confidence,
+                          customer: understandingResult.understanding.categories.customer.confidence,
+                          solution: understandingResult.understanding.categories.solution.confidence,
+                        },
+                      },
+                    })
                   }
                 }
               }
@@ -523,5 +609,112 @@ founderSessionsRouter.post(
         'X-Accel-Buffering': 'no',
       },
     )
+  },
+)
+
+// POST /api/v1/startups/:id/sessions/:sessionId/request-assessment
+// Beta early-exit path: founder elects to generate an assessment before natural completion.
+// Validates earlyExitEligible, forces session to completed with blueprintMode = 'hypothesis',
+// and computes generous gapsInBlueprint so all unvalidated areas are clearly labeled downstream.
+founderSessionsRouter.post(
+  '/:id/sessions/:sessionId/request-assessment',
+  requireAuth,
+  zValidator('param', sessionIdParam),
+  async (c) => {
+    const { id: startupId, sessionId } = c.req.valid('param')
+    const userId = c.var.user.id
+
+    await requireStartupOwner(startupId, userId)
+    const session = await requireSessionOwner(sessionId, startupId, userId)
+
+    if (session.status !== 'active') {
+      throw new BusinessRuleError('Session is no longer active')
+    }
+
+    const understanding = await loadUnderstanding(db, sessionId)
+
+    if (!understanding.earlyExitEligible) {
+      throw new BusinessRuleError(
+        'Session does not yet meet the minimum requirements for early assessment generation. ' +
+        'Problem, Customer, and Solution must each reach 50% confidence and overall understanding must reach 70%.',
+      )
+    }
+
+    // Force-complete the understanding with honest hypothesis framing.
+    // gapsInBlueprint covers all categories that lack confirmed external validation,
+    // so the blueprint agent labels them clearly as hypothesis sections.
+    const gapsInBlueprint = UNDERSTANDING_CATEGORIES.filter(
+      (cat) => understanding.categories[cat].validationStatus !== 'validated',
+    ) as typeof understanding.gapsInBlueprint
+
+    const forcedUnderstanding = {
+      ...understanding,
+      isComplete:        true,
+      blueprintMode:     'hypothesis' as const,
+      completionReason:  'founder_requested_early_exit',
+      gapsInBlueprint,
+      earlyExitEligible: false,
+      warnings:          understanding.warnings,
+    }
+
+    // Persist the forced-complete understanding.
+    const existingRow = await db.query.founderUnderstanding.findFirst({
+      where: eq(founderUnderstanding.sessionId, sessionId),
+    })
+
+    const upsertPayload = {
+      sessionId,
+      startupId,
+      userId,
+      isComplete:   true,
+      understanding: forcedUnderstanding,
+      updatedAt:    new Date(),
+    }
+
+    if (existingRow) {
+      await db
+        .update(founderUnderstanding)
+        .set(upsertPayload)
+        .where(eq(founderUnderstanding.sessionId, sessionId))
+    } else {
+      await db.insert(founderUnderstanding).values(upsertPayload)
+    }
+
+    // Close the session.
+    const durationSeconds = Math.round(
+      (Date.now() - session.createdAt.getTime()) / 1000,
+    )
+    await db
+      .update(founderSessions)
+      .set({
+        status:                 'completed',
+        sessionDurationSeconds: durationSeconds,
+        updatedAt:              new Date(),
+      })
+      .where(eq(founderSessions.id, sessionId))
+
+    await logActivity(db, {
+      userId,
+      startupId,
+      type:        'session.completed',
+      description: `Founder session completed via early exit for startup ${startupId}`,
+      meta: {
+        sessionId,
+        earlyExit:         true,
+        founderStage:      session.founderStage ?? 'building',
+        blueprintMode:     'hypothesis',
+        overallConfidence: understanding.overallConfidence,
+        messagesCount:     session.messagesCount,
+        durationSeconds,
+        gapsInBlueprint,
+        requiredConfidence: {
+          problem:  understanding.categories.problem.confidence,
+          customer: understanding.categories.customer.confidence,
+          solution: understanding.categories.solution.confidence,
+        },
+      },
+    })
+
+    return c.json({ data: { understanding: forcedUnderstanding } }, 200)
   },
 )

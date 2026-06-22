@@ -42,22 +42,74 @@ const generateBody = z.object({
   sessionId: z.string().uuid('Invalid session ID'),
 })
 
+const sessionNestedParam = z.object({
+  id:        z.string().uuid('Invalid startup ID'),
+  sessionId: z.string().uuid('Invalid session ID'),
+})
+
 const versionIdParam = z.object({
   id:        z.string().uuid('Invalid startup ID'),
   versionId: z.string().uuid('Invalid version ID'),
 })
 
+// ── Shared generation helper ──────────────────────────────────────────────────
+// Validates the session, creates a generation job, builds agent context, and
+// returns an SSE ReadableStream. Used by both generate routes so the 40-line
+// handler body is not duplicated.
+async function runAssessmentStream(
+  startupId: string,
+  sessionId: string,
+  userId:    string,
+): Promise<ReadableStream> {
+  const session = await db.query.founderSessions.findFirst({
+    where: and(
+      eq(founderSessions.id, sessionId),
+      eq(founderSessions.startupId, startupId),
+      eq(founderSessions.userId, userId),
+    ),
+  })
+  if (!session) throw new NotFoundError('Session not found')
+  if (session.status !== 'completed') throw new BusinessRuleError(
+    'Session must be completed before generating an opportunity assessment',
+  )
+
+  const [job] = await db
+    .insert(generationJobs)
+    .values({
+      userId,
+      startupId,
+      type:          'opportunity',
+      status:        'pending',
+      model:         'gpt-4o',
+      provider:      'openai',
+      promptVersion: PROMPT_VERSION,
+    })
+    .returning()
+
+  const input = await buildOpportunityContext(db, startupId, sessionId, userId, job.id)
+
+  return new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder()
+      const emit    = (data: string) => controller.enqueue(encoder.encode(data))
+
+      try {
+        for await (const event of runAgent(new OpportunityAgent(), input, db, anthropic, openai)) {
+          emit(formatSSE(event))
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Generation failed'
+        emit(formatSSE(errorEvent('GENERATION_FAILED', msg, false)))
+      } finally {
+        controller.close()
+      }
+    },
+  })
+}
+
 // ── POST /:id/opportunity/generate  ← SSE ────────────────────────────────────
-// Creates a generation_jobs row, builds context from the completed founder session,
-// runs OpportunityAgent via the standard runner, and streams GenerationEvents as SSE.
-//
-// SummaryStep integration: buildOpportunityContext() loads the latest session_summary
-// row alongside founder_memory, founder_understanding, and evidence_records. No
-// additional summary generation is needed here — the adaptive summary in the chat
-// pipeline ensures the summary is current when the session completes.
-//
-// Job creation order matters: the job row must exist before buildOpportunityContext()
-// is called so the jobId is threaded into the input contract and available to the runner.
+// Legacy generation route — sessionId supplied in the request body.
+// New callers should prefer POST /:id/sessions/:sessionId/opportunity-assessment.
 opportunityRouter.post(
   '/:id/opportunity/generate',
   requireAuth,
@@ -69,65 +121,26 @@ opportunityRouter.post(
     const userId            = c.var.user.id
 
     await requireStartupOwner(startupId, userId)
+    const stream = await runAssessmentStream(startupId, sessionId, userId)
+    return c.body(stream, 200, SSE_HEADERS)
+  },
+)
 
-    // Validate session: must belong to this startup/user and be completed.
-    // Generating an opportunity assessment against an in-progress session produces
-    // unreliable output — the conversation has not reached the understanding threshold.
-    const session = await db.query.founderSessions.findFirst({
-      where: and(
-        eq(founderSessions.id, sessionId),
-        eq(founderSessions.startupId, startupId),
-        eq(founderSessions.userId, userId),
-      ),
-    })
-    if (!session)                       throw new NotFoundError('Session not found')
-    if (session.status !== 'completed') throw new BusinessRuleError(
-      'Session must be completed before generating an opportunity assessment',
-    )
+// ── POST /:id/sessions/:sessionId/opportunity-assessment  ← SSE ──────────────
+// REST-canonical generation route — sessionId carried in the URL path.
+// Validates session ownership and completion, then streams GenerationEvents as SSE
+// via the shared runAssessmentStream helper.
+opportunityRouter.post(
+  '/:id/sessions/:sessionId/opportunity-assessment',
+  requireAuth,
+  zValidator('param', sessionNestedParam),
+  async (c) => {
+    const { id: startupId, sessionId } = c.req.valid('param')
+    const userId                       = c.var.user.id
 
-    // Create generation job. The runner reads model and provider from this row.
-    const [job] = await db
-      .insert(generationJobs)
-      .values({
-        userId,
-        startupId,
-        type:          'opportunity',
-        status:        'pending',
-        model:         'gpt-4o',
-        provider:      'openai',
-        promptVersion: PROMPT_VERSION,
-      })
-      .returning()
-
-    // Build context: loads founder_memory, founder_understanding, evidence_records,
-    // session_summary for this session. Falls back to safe empty values on any parse
-    // failure so the agent always receives a structurally valid input.
-    const input = await buildOpportunityContext(db, startupId, sessionId, userId, job.id)
-
-    // Stream agent events as SSE. The runner handles job state updates (active/done/failed)
-    // and retries (up to maxAttempts). Any error that escapes the runner is caught here
-    // and emitted as a terminal error event before the stream closes.
-    return c.body(
-      new ReadableStream({
-        async start(controller) {
-          const encoder = new TextEncoder()
-          const emit    = (data: string) => controller.enqueue(encoder.encode(data))
-
-          try {
-            for await (const event of runAgent(new OpportunityAgent(), input, db, anthropic, openai)) {
-              emit(formatSSE(event))
-            }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : 'Generation failed'
-            emit(formatSSE(errorEvent('GENERATION_FAILED', msg, false)))
-          } finally {
-            controller.close()
-          }
-        },
-      }),
-      200,
-      SSE_HEADERS,
-    )
+    await requireStartupOwner(startupId, userId)
+    const stream = await runAssessmentStream(startupId, sessionId, userId)
+    return c.body(stream, 200, SSE_HEADERS)
   },
 )
 
@@ -171,6 +184,60 @@ opportunityRouter.get(
     const parsed = OpportunityAssessmentContentSchema.safeParse(row.content)
     if (!parsed.success) {
       console.error('[opportunity GET] content failed schema validation', parsed.error.format())
+      throw new Error('Opportunity assessment content is corrupted')
+    }
+
+    return c.json({
+      data: {
+        assessmentId:  row.assessmentId,
+        versionId:     row.versionId,
+        versionNumber: row.versionNumber,
+        content:       parsed.data,
+        generatedAt:   row.generatedAt,
+      },
+    })
+  },
+)
+
+// ── GET /:id/opportunity-assessment  ─────────────────────────────────────────
+// REST-canonical read route — mirrors GET /:id/opportunity with a kebab-case
+// resource name consistent with the session-nested POST above.
+opportunityRouter.get(
+  '/:id/opportunity-assessment',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  async (c) => {
+    const { id: startupId } = c.req.valid('param')
+    const userId            = c.var.user.id
+
+    await requireStartupOwner(startupId, userId)
+
+    const [row] = await db
+      .select({
+        assessmentId:  opportunityAssessments.id,
+        versionId:     opportunityAssessmentVersions.id,
+        versionNumber: opportunityAssessmentVersions.versionNumber,
+        content:       opportunityAssessmentVersions.content,
+        generatedAt:   opportunityAssessmentVersions.createdAt,
+      })
+      .from(opportunityAssessments)
+      .innerJoin(
+        opportunityAssessmentVersions,
+        eq(opportunityAssessmentVersions.assessmentId, opportunityAssessments.id),
+      )
+      .where(
+        and(
+          eq(opportunityAssessments.startupId, startupId),
+          eq(opportunityAssessmentVersions.isCurrent, true),
+        ),
+      )
+      .limit(1)
+
+    if (!row) throw new NotFoundError('No opportunity assessment found for this startup')
+
+    const parsed = OpportunityAssessmentContentSchema.safeParse(row.content)
+    if (!parsed.success) {
+      console.error('[opportunity-assessment GET] content failed schema validation', parsed.error.format())
       throw new Error('Opportunity assessment content is corrupted')
     }
 

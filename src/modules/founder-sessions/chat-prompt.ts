@@ -1,6 +1,6 @@
 import type { Startup } from '../../lib/db/schema/startups.ts'
 import type { SessionSummary } from '../../lib/contracts/session-summary.ts'
-import type { FounderUnderstanding, UnderstandingCategory } from '../../lib/contracts/founder-understanding.ts'
+import type { FounderUnderstanding, UnderstandingCategory, FounderStage } from '../../lib/contracts/founder-understanding.ts'
 import type { FounderMemory } from '../../lib/contracts/founder-memory.ts'
 import {
   CATEGORY_DISPLAY,
@@ -24,6 +24,8 @@ const CATEGORY_FOCUS_GUIDANCE: Record<UnderstandingCategory, string> = {
   risks:        'the biggest threats to viability and the key unproven assumptions',
   // Revision 2: founder_fit probes credibility and execution capability.
   founder_fit:  'the founder\'s domain expertise, existing customer relationships, and what makes them uniquely positioned to win',
+  // v2.2 PR3: supply-side probes provider acquisition, quality, and retention for marketplace startups.
+  supply_side:  'how supply-side participants (providers, sellers, hosts, drivers) are recruited, onboarded, quality-controlled, and retained',
 }
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -36,8 +38,13 @@ export function buildChatSystemPrompt(
   startup: Startup,
   latestSummary: SessionSummary | null,
   understanding: FounderUnderstanding = EMPTY_UNDERSTANDING,
+  founderStage: FounderStage = 'building',
+  // v2.2 PR2: pass the session-level flag so the first-turn prompt is marketplace-aware
+  // even before the understanding row exists. Falls back to understanding.marketplaceDetected.
+  marketplaceDetected?: boolean,
 ): string {
-  const lines: string[] = [
+  const effectiveMarketplaceDetected = marketplaceDetected ?? understanding.marketplaceDetected
+  const lines: (string | undefined)[] = [
     'You are an experienced startup advisor and AI Technical Cofounder.',
     'Your role is to deeply understand the startup through investigative conversation.',
     '',
@@ -73,13 +80,49 @@ export function buildChatSystemPrompt(
     )
   }
 
+  // SESSION MODE block — tells the advisor how to frame the conversation.
+  const modeLabel = founderStage === 'idea'
+    ? 'PRE-VALIDATION (idea stage)'
+    : founderStage === 'revenue'
+    ? 'REVENUE STAGE'
+    : 'BUILDING STAGE'
+  lines.push(
+    '',
+    '--- SESSION MODE ---',
+    `Founder stage: ${modeLabel}`,
+  )
+  if (founderStage === 'idea') {
+    lines.push(
+      'This founder is pre-validation. They may not have spoken to customers yet.',
+      'Treat confirmed knowledge gaps with curiosity, not concern.',
+      'The session can complete at 60% confidence on required categories (Problem, Customer, Solution).',
+      'The output will be framed as a hypothesis blueprint — a thinking tool, not a validated spec.',
+    )
+  }
+
+  if (effectiveMarketplaceDetected) {
+    lines.push(
+      '',
+      '--- MARKETPLACE PLATFORM ---',
+      'This startup is a two-sided marketplace or platform.',
+      'Both supply-side (providers, sellers, hosts, drivers) and demand-side (buyers, users, guests, riders) must be understood.',
+      'When exploring the customer dimension, ask about BOTH sides — who creates value and who consumes it.',
+      'Supply-side acquisition and quality control are often the harder constraint for marketplace startups.',
+    )
+  }
+
   if (understanding.weakestCategory !== null) {
     lines.push('', '--- CURRENT UNDERSTANDING STATE ---')
 
     for (const [cat, state] of Object.entries(understanding.categories) as [UnderstandingCategory, typeof understanding.categories.problem][]) {
+      // supply_side is invisible to non-marketplace sessions — omit from prompt entirely.
+      if (cat === 'supply_side' && !effectiveMarketplaceDetected) continue
+
       const statusIcon    = state.status === 'complete' ? '✓' : state.status === 'partial' ? '~' : '?'
       const strengthLabel = EVIDENCE_STRENGTH_LEVELS[state.evidenceStrength] ?? 'Unknown'
-      const requiredFlag  = CATEGORY_DISPLAY[cat].required ? ' [required]' : ''
+      // supply_side is effectively required for marketplace sessions even though CATEGORY_DISPLAY marks it false.
+      const isRequired    = CATEGORY_DISPLAY[cat].required || (cat === 'supply_side' && effectiveMarketplaceDetected)
+      const requiredFlag  = isRequired ? ' [required]' : ''
       const gapFlag       = state.validationStatus === 'explicitly_unvalidated' ? ' [gap confirmed]' : ''
       lines.push(
         `${statusIcon} ${CATEGORY_DISPLAY[cat].label}${requiredFlag}${gapFlag}: ${state.confidence}% (${strengthLabel})`,
@@ -90,6 +133,8 @@ export function buildChatSystemPrompt(
 
     // Blocked topics: categories that hit the saturation threshold OR have 3+ focus turns.
     // These are exhausted — questioning them yields no new information.
+    // v2.1 F3: customer saturation is suppressed when multiIcpDetected — marketplace founders
+    // have a legitimately complex customer dimension and must not be blocked there.
     const focusHistory = understanding.focusHistory ?? []
     const focusSaturated = UNDERSTANDING_CATEGORIES.filter(
       (cat) => focusHistory.filter((h) => h === cat).length >= 3,
@@ -97,14 +142,17 @@ export function buildChatSystemPrompt(
     const statSaturated = UNDERSTANDING_CATEGORIES.filter(
       (cat) => (understanding.categories[cat].saturationCount ?? 0) >= SATURATION_THRESHOLD,
     )
-    const blockedCategories = [...new Set([...focusSaturated, ...statSaturated])]
+    const allBlocked = [...new Set([...focusSaturated, ...statSaturated])]
+    const effectiveBlockedCategories = understanding.multiIcpDetected
+      ? allBlocked.filter((cat) => cat !== 'customer')
+      : allBlocked
 
-    if (blockedCategories.length > 0) {
+    if (effectiveBlockedCategories.length > 0) {
       lines.push(
         '',
         '--- BLOCKED TOPICS (DO NOT ASK ABOUT THESE) ---',
         'These categories are exhausted — repeated questioning has yielded no new information.',
-        'Do NOT ask about: ' + blockedCategories.map((c) => CATEGORY_DISPLAY[c].label).join(', ') + '.',
+        'Do NOT ask about: ' + effectiveBlockedCategories.map((c) => CATEGORY_DISPLAY[c].label).join(', ') + '.',
         'Move on. A different area of the business needs attention now.',
       )
     }
@@ -128,23 +176,73 @@ export function buildChatSystemPrompt(
       )
     }
 
+    // v2.1 F4: Pivot acknowledgment. Fires on the turn the pivot is detected.
+    // The advisor must name both directions and confirm which the founder wants to pursue.
+    // This is a chat signal only — confidence scores are NOT reset here (that is v2.2).
+    if (understanding.pivotDetected) {
+      lines.push(
+        '',
+        '--- PIVOT DETECTED ---',
+        'The founder appears to have changed direction mid-session.',
+        'Before asking your next question, briefly acknowledge this shift.',
+        'Name both directions: the original thesis and the new direction you detected.',
+        'Ask the founder to confirm which direction they want to pursue going forward.',
+        'Example: "Earlier we were exploring [X]. It sounds like you\'re now focused on [Y].',
+        'Which direction do you want to build on for this session?"',
+        'Do NOT reset the conversation or re-ask questions you already covered.',
+        'Once the founder confirms, continue from the confirmed direction.',
+      )
+    }
+
     if (understanding.isComplete) {
+      const isHypothesis = understanding.blueprintMode === 'hypothesis'
       lines.push(
         '',
         '--- SESSION STATUS: COMPLETE ---',
         'The required dimensions (Problem, Customer, Solution) are well understood.',
         'Do NOT ask any more discovery questions.',
-        'Acknowledge the conversation warmly and tell the founder that Xenysis has',
-        'enough to generate their Opportunity Assessment and Startup Blueprint.',
-        'Invite them to proceed. If any supporting areas had low confidence, mention',
-        'them briefly as areas to revisit after seeing the initial analysis.',
       )
+
+      if (isHypothesis) {
+        lines.push(
+          'This session completed as a HYPOTHESIS BLUEPRINT.',
+          'Acknowledge the conversation warmly. Tell the founder that Xenysis has captured their',
+          'hypothesis and will generate a Hypothesis Blueprint — a structured thinking tool to',
+          'sharpen their thesis before they go out to validate it.',
+          'Be clear: this is not a validated spec. It reflects their best current thinking.',
+          'Invite them to proceed and remind them that validation is the critical next step.',
+        )
+      } else {
+        lines.push(
+          'Acknowledge the conversation warmly and tell the founder that Xenysis has',
+          'enough to generate their Opportunity Assessment and Startup Blueprint.',
+          'Invite them to proceed. If any supporting areas had low confidence, mention',
+          'them briefly as areas to revisit after seeing the initial analysis.',
+        )
+      }
 
       if (understanding.warnings.length > 0) {
         lines.push('', 'NOTE FOR YOUR CLOSING MESSAGE — mention these areas need follow-up:')
         for (const w of understanding.warnings) {
           lines.push(`  - ${CATEGORY_DISPLAY[w.category].label}: ${w.confidence}% confidence`)
         }
+      }
+
+      // v2.1 F5: If any categories were explicitly unvalidated at completion, name them.
+      // The blueprint will label these fields — tell the founder what to expect.
+      const gapsInBlueprint = understanding.gapsInBlueprint ?? []
+      if (gapsInBlueprint.length > 0) {
+        lines.push(
+          '',
+          'GAPS TO NAME IN YOUR CLOSING MESSAGE:',
+          'The following areas had no external validation. Tell the founder, warmly and transparently:',
+          ...gapsInBlueprint.map((cat) => `  - ${CATEGORY_DISPLAY[cat].label}: marked as hypothesis in the blueprint`),
+          '',
+          'Example framing: "A few areas — [X] and [Y] — are based on your hypothesis',
+          'since you haven\'t validated them yet. The blueprint will label those sections',
+          'clearly so you know exactly where to focus your validation work."',
+          'Do NOT apologize or frame this as a deficiency — it is useful, actionable transparency.',
+        )
       }
     } else if (understanding.questioningMode === 'gap_identification') {
       lines.push(
@@ -163,35 +261,158 @@ export function buildChatSystemPrompt(
         'Do NOT skip step 3. Do NOT offer an early assessment. Continue discovery.',
       )
     } else {
-      const weakest      = understanding.weakestCategory
-      const weakestState = understanding.categories[weakest]
-      const focusGuide   = CATEGORY_FOCUS_GUIDANCE[weakest]
-      const categoryName = CATEGORY_DISPLAY[weakest].label
-      const strengthLabel = EVIDENCE_STRENGTH_LEVELS[weakestState.evidenceStrength]
+      // Pre-scan: find any category where assumption-gathering is exhausted before routing
+      // by weakest category. This decouples validation-planning from the focus-cooling selector,
+      // which can displace a saturated category before the nested pivot condition is met.
+      const validationPlanningCandidate = UNDERSTANDING_CATEGORIES.find((cat) => {
+        if (cat === 'supply_side' && !effectiveMarketplaceDetected) return false
+        const state = understanding.categories[cat]
+        return (
+          state.validationStatus === 'explicitly_unvalidated' &&
+          state.saturationCount >= 1 &&
+          !state.validationPlanningCompleted
+        )
+      }) ?? null
 
-      if (weakestState.validationStatus === 'explicitly_unvalidated') {
-        // Category has confirmed absence of external evidence — ask understanding questions only.
-        lines.push(
-          '',
-          '--- FOCUS INSTRUCTION ---',
-          `${categoryName} has no external evidence yet — the founder confirmed this.`,
-          'Ask an UNDERSTANDING-SEEKING question only. DO NOT ask for validation, research, or customer data.',
-          'Frame your question around what the founder BELIEVES or HYPOTHESIZES:',
-          '  - What they expect to find when they do validate',
-          '  - Their mental model or reasoning about this area',
-          '  - Their assumptions or best-guess about the answer',
-          `Focus area: ${focusGuide}`,
-          'Example framing: "Who do you believe..." / "Why do you think..." / "What would you expect..."',
-        )
+      if (validationPlanningCandidate !== null) {
+        const vpCategoryName = CATEGORY_DISPLAY[validationPlanningCandidate].label
+        if (validationPlanningCandidate === 'supply_side') {
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION (SUPPLY SIDE — VALIDATION PLANNING) ---',
+            'This marketplace founder has confirmed they have not spoken with supply-side participants and has shared their best assumptions.',
+            'Do NOT ask more questions about supply-side pain points, motivations, or incentives.',
+            'All further questions in that direction generate speculation, not evidence.',
+            'Pivot to validation planning. Ask exactly ONE of the following:',
+            '  - "How would you go about validating whether [specific supply-side assumption] is actually true?"',
+            '  - "What evidence would most change your confidence in your assumptions about the supply side?"',
+            '  - "What is the fastest experiment you could run to test whether providers face the problems you expect?"',
+            '  - "What is the biggest risk to your model if your assumptions about the supply side turn out to be wrong?"',
+            'The goal is to move from assumption-collection into validation planning.',
+            'Do NOT ask for more beliefs, expectations, or hypotheses about supply-side dynamics.',
+          )
+        } else {
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION (VALIDATION PLANNING) ---',
+            `${vpCategoryName} has no external evidence yet and the founder has shared their best assumptions across multiple turns.`,
+            'Do NOT ask for more beliefs, expectations, or hypotheses in this area.',
+            'Pivot to validation planning. Ask exactly ONE of:',
+            '  - "How would you validate your assumption about [specific belief from the conversation]?"',
+            '  - "What evidence would most change your confidence in what you believe about [topic]?"',
+            '  - "What is the fastest experiment you could run to test whether this is true?"',
+            '  - "What is the biggest risk to your startup if this assumption turns out to be wrong?"',
+            'The goal is to shift from assumption-collection into evidence generation and risk awareness.',
+          )
+        }
       } else {
-        lines.push(
-          '',
-          '--- FOCUS INSTRUCTION ---',
-          `Your weakest area is: ${categoryName} (${weakestState.confidence}% confidence, ${strengthLabel}).`,
-          `Your next question MUST investigate: ${focusGuide}.`,
-          'Ground your question in something the founder has already mentioned.',
-          'Do NOT ask about categories where confidence is already above 80%.',
-        )
+        const weakest      = understanding.weakestCategory
+        const weakestState = understanding.categories[weakest]
+        const focusGuide   = CATEGORY_FOCUS_GUIDANCE[weakest]
+        const categoryName = CATEGORY_DISPLAY[weakest].label
+        const strengthLabel = EVIDENCE_STRENGTH_LEVELS[weakestState.evidenceStrength]
+
+        if (weakest === 'supply_side' && effectiveMarketplaceDetected) {
+          // v2.2 PR3: Supply-side is the weakest category for a marketplace — probe provider dynamics.
+          const supplySideIsGap = weakestState.validationStatus === 'explicitly_unvalidated'
+          // Fallback: fires only when supply_side is still weakest and saturationCount reached 2
+          // without the pre-scan catching it first (e.g. validationPlanningCompleted already set).
+          const assumptionSaturated = supplySideIsGap && weakestState.saturationCount >= 2 && !weakestState.validationPlanningCompleted
+
+          if (assumptionSaturated) {
+            lines.push(
+              '',
+              '--- FOCUS INSTRUCTION (SUPPLY SIDE — VALIDATION PLANNING) ---',
+              'This marketplace founder has confirmed they have not spoken with supply-side participants and has shared their best assumptions.',
+              'Do NOT ask more questions about supply-side pain points, motivations, or incentives.',
+              'All further questions in that direction generate speculation, not evidence.',
+              'Pivot to validation planning. Ask exactly ONE of the following:',
+              '  - "How would you go about validating whether [specific supply-side assumption] is actually true?"',
+              '  - "What evidence would most change your confidence in your assumptions about the supply side?"',
+              '  - "What is the fastest experiment you could run to test whether providers face the problems you expect?"',
+              '  - "What is the biggest risk to your model if your assumptions about the supply side turn out to be wrong?"',
+              'The goal is to move from assumption-collection into validation planning.',
+              'Do NOT ask for more beliefs, expectations, or hypotheses about supply-side dynamics.',
+            )
+          } else {
+            lines.push(
+              '',
+              '--- FOCUS INSTRUCTION (SUPPLY SIDE) ---',
+              supplySideIsGap
+                ? 'This marketplace founder has confirmed they have NOT yet spoken with any supply-side participants.'
+                : 'This marketplace startup has not yet explored its supply side.',
+              `Supply Side understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
+              'The supply side = the independent providers, sellers, hosts, or drivers who create value on the platform.',
+              supplySideIsGap
+                ? 'Ask an UNDERSTANDING-SEEKING question — do NOT ask for validation evidence they confirmed they do not have.'
+                : undefined,
+              'Your next question MUST investigate one of:',
+              '  - How does the startup plan to recruit supply-side participants? (GTM for supply)',
+              '  - What makes supply-side participants choose this platform over going direct?',
+              '  - How does the startup plan to ensure supply quality? (screening, rating, or curation)',
+              '  - What is the supply-side onboarding or retention strategy?',
+              supplySideIsGap
+                ? 'Frame your question as: "Who do you believe...", "What do you expect...", or "How do you plan to..."'
+                : 'Do NOT conflate supply-side with the demand-side (buyers/users) in your question.',
+              'Example: "How do you plan to bring on your first [providers/sellers/hosts] — ',
+              'what makes them want to list on your platform over just going direct?"',
+            )
+          }
+        } else if (weakest === 'customer' && understanding.multiIcpDetected) {
+          // v2.1 F3: Multi-ICP / marketplace customer focus — shift from single ICP to beachhead.
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION (MULTI-ICP / MARKETPLACE) ---',
+            'This is a dual-sided or multi-segment business. The founder has both a supply side and a demand side.',
+            `Customer understanding is at ${weakestState.confidence}% confidence (${strengthLabel}).`,
+            'Do NOT ask "who is your exact buyer" as if there is one answer.',
+            'Instead, focus on: which segment is the beachhead?',
+            'Ask the founder to identify which side or segment they are prioritizing first',
+            'and what their go-to-market motion looks like for that beachhead segment.',
+            'Example: "Given you have both [side A] and [side B], which do you acquire first,',
+            'and why does that sequencing matter to your business model?"',
+          )
+        } else if (weakestState.validationStatus === 'explicitly_unvalidated') {
+          // Fallback: fires only when the unvalidated category is still weakest AND the
+          // pre-scan didn't catch it (validationPlanningCompleted already set).
+          if (weakestState.saturationCount >= 2 && !weakestState.validationPlanningCompleted) {
+            lines.push(
+              '',
+              '--- FOCUS INSTRUCTION (VALIDATION PLANNING) ---',
+              `${categoryName} has no external evidence yet and the founder has shared their best assumptions across multiple turns.`,
+              'Do NOT ask for more beliefs, expectations, or hypotheses in this area.',
+              'Pivot to validation planning. Ask exactly ONE of:',
+              '  - "How would you validate your assumption about [specific belief from the conversation]?"',
+              '  - "What evidence would most change your confidence in what you believe about [topic]?"',
+              '  - "What is the fastest experiment you could run to test whether this is true?"',
+              '  - "What is the biggest risk to your startup if this assumption turns out to be wrong?"',
+              'The goal is to shift from assumption-collection into evidence generation and risk awareness.',
+            )
+          } else {
+            // Category has confirmed absence of external evidence — ask understanding questions only.
+            lines.push(
+              '',
+              '--- FOCUS INSTRUCTION ---',
+              `${categoryName} has no external evidence yet — the founder confirmed this.`,
+              'Ask an UNDERSTANDING-SEEKING question only. DO NOT ask for validation, research, or customer data.',
+              'Frame your question around what the founder BELIEVES or HYPOTHESIZES:',
+              '  - What they expect to find when they do validate',
+              '  - Their mental model or reasoning about this area',
+              '  - Their assumptions or best-guess about the answer',
+              `Focus area: ${focusGuide}`,
+              'Example framing: "Who do you believe..." / "Why do you think..." / "What would you expect..."',
+            )
+          }
+        } else {
+          lines.push(
+            '',
+            '--- FOCUS INSTRUCTION ---',
+            `Your weakest area is: ${categoryName} (${weakestState.confidence}% confidence, ${strengthLabel}).`,
+            `Your next question MUST investigate: ${focusGuide}.`,
+            'Ground your question in something the founder has already mentioned.',
+            'Do NOT ask about categories where confidence is already above 80%.',
+          )
+        }
       }
     }
   }
@@ -245,8 +466,9 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'integer' },
           risks:       { type: 'integer' },
           founder_fit: { type: 'integer' },  // Revision 2
+          supply_side: { type: 'integer' },  // v2.2 PR3 — score 0 for non-marketplace
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
 
@@ -262,8 +484,9 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'array', items: { type: 'string' }, maxItems: 3 },
           risks:       { type: 'array', items: { type: 'string' }, maxItems: 3 },
           founder_fit: { type: 'array', items: { type: 'string' }, maxItems: 3 },  // Revision 2
+          supply_side: { type: 'array', items: { type: 'string' }, maxItems: 3 },  // v2.2 PR3
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
 
@@ -283,10 +506,31 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'integer', minimum: 1, maximum: 6 },
           risks:       { type: 'integer', minimum: 1, maximum: 6 },
           founder_fit: { type: 'integer', minimum: 1, maximum: 6 },
+          supply_side: { type: 'integer', minimum: 1, maximum: 6 },  // v2.2 PR3
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
+
+      // ── v2.1 F3: Multi-ICP / marketplace detection ────────────────────────
+      // Set true ONLY for genuine two-sided marketplaces or dual-segment businesses
+      // where both sides have materially different pricing or service models.
+      // Do NOT set true for buyer/user splits, segment variations, or discovery uncertainty.
+      multi_icp_detected: { type: 'boolean' },
+
+      // ── v2.2 PR2: Marketplace platform detection ──────────────────────────
+      // Set true ONLY for genuine two-sided platforms where distinct supply-side participants
+      // CREATE value and distinct demand-side participants CONSUME it.
+      // Supply-side participants are recruited, onboarded, and managed separately from buyers.
+      // Examples: Airbnb (hosts+guests), Uber (drivers+riders), Etsy (sellers+buyers).
+      // Do NOT set true for: SaaS with multiple user roles, B2B2C, or buyer/user splits.
+      marketplace_detected: { type: 'boolean' },
+
+      // ── v2.1 F4: Pivot detection ───────────────────────────────────────────
+      // Set true ONLY when a genuine mid-session direction change is detected — the
+      // founder explicitly shifts the core problem, target customer, or solution domain.
+      // Do NOT set true for scope refinement or added detail within the same thesis.
+      pivot_detected: { type: 'boolean' },
 
       // ── This revision: Per-category absence signal ────────────────────────
       // Classify whether the founder stated they lack external evidence for each category.
@@ -305,8 +549,26 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
           competition: { type: 'string', enum: ['none', 'weak', 'strong'] },
           risks:       { type: 'string', enum: ['none', 'weak', 'strong'] },
           founder_fit: { type: 'string', enum: ['none', 'weak', 'strong'] },
+          supply_side: { type: 'string', enum: ['none', 'weak', 'strong'] },  // v2.2 PR3
         },
-        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit'],
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
+        additionalProperties: false,
+      },
+      // v2.2 PR3: explicit external-contact flag per category.
+      category_has_external_contact: {
+        type: 'object',
+        properties: {
+          problem:     { type: 'boolean' },
+          customer:    { type: 'boolean' },
+          solution:    { type: 'boolean' },
+          market:      { type: 'boolean' },
+          pricing:     { type: 'boolean' },
+          competition: { type: 'boolean' },
+          risks:       { type: 'boolean' },
+          founder_fit: { type: 'boolean' },
+          supply_side: { type: 'boolean' },
+        },
+        required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
     },
@@ -316,7 +578,8 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
       'market_signals', 'competitive_advantages', 'named_competitors', 'assumptions',
       'risks', 'key_insights', 'confidence_score',
       'category_confidence', 'category_evidence', 'category_evidence_strength',
-      'category_absence_signals',
+      'category_absence_signals', 'category_has_external_contact',
+      'multi_icp_detected', 'marketplace_detected', 'pivot_detected',
     ],
     additionalProperties: false,
   },
@@ -363,6 +626,16 @@ export function buildMemoryExtractionSystemPrompt(
     '  - 0 = no information about the founder at all.',
     '  - 80+ = clear, specific evidence of domain authority and customer access.',
     '',
+    'SUPPLY SIDE scoring guidance (supply_side):',
+    '  - Only relevant for genuine marketplace/platform startups (e.g. Airbnb, Uber, Etsy patterns).',
+    '  - Score based on: how supply-side participants are recruited, onboarded, quality-controlled,',
+    '    and retained. Supply-side = providers, sellers, hosts, drivers, freelancers, etc.',
+    '  - For non-marketplace startups: output supply_side = 0, evidence = [], strength = 1.',
+    '  - 0   = startup is not a marketplace, OR supply-side has not been discussed.',
+    '  - 30+ = founder has described who the supply-side participants are.',
+    '  - 60+ = founder has explained how they will acquire and onboard supply-side participants.',
+    '  - 80+ = founder has evidence of supply-side acquisition (sign-ups, waitlist, partnerships).',
+    '',
     'EVIDENCE STRENGTH (1-6 per category, rate HIGHEST level present):',
     '  1 = Founder assumption OR category not discussed this turn (minimum floor — never output 0)',
     '  2 = Anecdotal observation ("I\'ve seen this happen in the industry")',
@@ -375,6 +648,27 @@ export function buildMemoryExtractionSystemPrompt(
     'For each category, list up to 3 specific statements extracted from THIS TURN only.',
     'Quote or closely paraphrase what the founder actually said.',
     'Use empty array [] if nothing new was learned about that category this turn.',
+    '',
+    'ABSENCE STATEMENTS ARE NOT CATEGORY EVIDENCE:',
+    'Statements expressing absence, uncertainty, or lack of validation do NOT belong in',
+    'category_evidence — they belong in category_absence_signals only.',
+    'If the only statements about a category this turn were absence or uncertainty statements,',
+    'output category_evidence[cat] = [].',
+    '',
+    'Absence/uncertainty statement patterns (output [] for evidence, classify the absence signal instead):',
+    '  "I haven\'t spoken to [supply-side role]."',
+    '  "I don\'t know whether they would [participate / list / join]."',
+    '  "I haven\'t validated [this / whether / if]."',
+    '  "It\'s currently an assumption."',
+    '  "I would need to [interview / validate] them first."',
+    '  "I\'m not sure if [X] would [Y]."',
+    '  Any rephrase of: zero contact with a participant class, or unvalidated assumption.',
+    '',
+    'Positive statements that DO belong in category_evidence (even if modest):',
+    '  "Studio owners charge $50/hour on average." (factual claim about the supply side)',
+    '  "I plan to recruit studios via photography Facebook groups." (acquisition strategy)',
+    '  "I believe studios sit empty 40% of the time." (specific hypothesis about a pain point)',
+    '  Any statement that adds a new fact, plan, estimate, or specific belief — not just restating absence.',
     '',
     'ABSENCE SIGNALS (classify per category as "none", "weak", or "strong"):',
     'Detect whether the founder stated they lack external evidence for each category THIS TURN.',
@@ -389,6 +683,7 @@ export function buildMemoryExtractionSystemPrompt(
     '             "We haven\'t done formal interviews." (informal may exist)',
     '             "I don\'t have hard data on market size." (data specifically, not conversations)',
     '             "I plan to talk to customers next month." (forward-looking)',
+    '             "I haven\'t validated whether studio owners would join." (hedge: "whether")',
     '',
     '  "strong" — Founder made an UNAMBIGUOUS, UNHEDGED, FIRST-PERSON statement of TOTAL absence.',
     '             No hedge words. No scope qualifiers limiting to a subtype. Direct and present-tense.',
@@ -403,6 +698,98 @@ export function buildMemoryExtractionSystemPrompt(
     'absence for that specific category THIS TURN. Otherwise output "none".',
     'Assign absence signals to the single most relevant category — do not spread one statement',
     'across multiple categories.',
+    '',
+    'MARKETPLACE SUPPLY-SIDE ROUTING:',
+    'For marketplace startups, "I haven\'t spoken with [role]" must be routed by which side of',
+    'the platform the named role belongs to — NOT always to customer.',
+    '  Supply-side roles (providers, hosts, sellers, drivers, studio owners, freelancers, etc.):',
+    '    → assign to supply_side',
+    '  Demand-side roles (buyers, users, bookers, photographers, clients, etc.):',
+    '    → assign to customer',
+    '',
+    'Supply-side absence examples (marketplace context):',
+    '  "I haven\'t spoken with studio owners."       → supply_side: "strong"',
+    '  "I haven\'t interviewed studio owners."       → supply_side: "strong"',
+    '  "No conversations with studio owners yet."   → supply_side: "strong"',
+    '  "Studio owners haven\'t been approached."    → supply_side: "strong"',
+    '  "I haven\'t spoken with photographers."      → customer: "strong"  (photographers are demand-side)',
+    '',
+    'SUPPLY-SIDE STRONG SIGNAL RULE:',
+    'When the founder names the supply-side participant class (e.g. "studio owners", "hosts",',
+    '"drivers") and states they have had zero contact or done zero validation with that class,',
+    'treat it as "strong" even though a specific role is named. The named role IS the complete',
+    'supply-side population — it is not a scope restriction the way "enterprise customers" is a',
+    'subset of all customers.',
+    '  "I haven\'t spoken with studio owners." → strong  (studio owners ARE the supply side)',
+    '  "I haven\'t spoken with enterprise customers." → weak  (enterprise is a subset of customers)',
+    '',
+    '',
+    'MULTI-ICP / MARKETPLACE DETECTION (multi_icp_detected):',
+    'Set multi_icp_detected = true ONLY when the founder describes a genuine two-sided marketplace',
+    'or dual-segment business where BOTH sides have materially different pricing or service models.',
+    'Examples that qualify:',
+    '  - "We charge suppliers $X/month and buyers pay per transaction" ✓',
+    '  - "We serve hospitals AND patients with separate onboarding and pricing" ✓',
+    'Do NOT set true for:',
+    '  - Buyer/user split within the same segment (buyer ≠ user of the same product)',
+    '  - Segment variations (enterprise vs SMB — same side, different sizes)',
+    '  - Uncertainty about who the customer is ("I\'m not sure if it\'s HR or IT")',
+    '  - B2B2C where only one side pays',
+    'Default: false.',
+    '',
+    'MARKETPLACE PLATFORM DETECTION (marketplace_detected):',
+    'Set marketplace_detected = true ONLY when the startup is a genuine two-sided PLATFORM where:',
+    '  1. Supply-side participants INDEPENDENTLY CREATE value (they are recruited and onboarded separately)',
+    '  2. Demand-side participants CONSUME that value',
+    '  3. The platform\'s job is to match and connect the two sides',
+    'Classic pattern: Airbnb (hosts create listings → guests consume them), Uber (drivers provide rides',
+    '→ riders consume them), Etsy (sellers create products → buyers purchase them).',
+    'The key test: does the startup need to RECRUIT, ONBOARD, and MANAGE a supply side separately?',
+    'If yes → marketplace_detected = true.',
+    'Do NOT set true for:',
+    '  - SaaS tools used by multiple types of users (HR tool used by managers AND employees)',
+    '  - B2B2C where the supply side is a single business, not a network of independent providers',
+    '  - Consulting, agency, or service businesses with clients and vendors',
+    '  - Dual-segment B2B businesses (marketplace_detected is about platform structure, not segments)',
+    'Default: false.',
+    '',
+    'PIVOT DETECTION (pivot_detected):',
+    'Set pivot_detected = true ONLY when a genuine mid-session direction change is detected.',
+    'A pivot changes the core problem domain, target customer, or solution category.',
+    'Examples that qualify:',
+    '  - Founder started with "B2B SaaS for law firms" and is now describing a B2C consumer app',
+    '  - Core problem shifts from "data entry waste" to "legal liability management"',
+    'Do NOT set true for:',
+    '  - Scope refinement ("actually it\'s mid-market, not enterprise")',
+    '  - Added detail or clarification within the same thesis',
+    '  - Normal conversation exploration of adjacent ideas',
+    'Default: false.',
+    '',
+    'EXTERNAL CONTACT FLAGS (category_has_external_contact):',
+    'Set true ONLY for categories where the founder explicitly stated CONFIRMED PAST direct contact',
+    'with an external party (customer, supplier, user, partner, etc.) THIS TURN.',
+    '',
+    'Qualifying statements (set true):',
+    '  "I\'ve spoken with 5 photographers about this specific problem." → customer: true',
+    '  "We interviewed 20 studio owners about their booking process." → supply_side: true',
+    '  "We have 3 paying customers." → customer: true, pricing: true',
+    '  "I talked to 10 potential users last month about this." → customer: true',
+    '  "We ran discovery calls with HR directors about this pain point." → customer: true',
+    '',
+    'NOT qualifying (set false):',
+    '  Relationship access or potential future contact: "I have relationships with photographers who could provide feedback."',
+    '  Knowing people without confirmed contact: "I know people in the industry I could reach out to."',
+    '  General industry conversations not tied to the problem: "I\'ve had conversations with photographers in the space."',
+    '  Product descriptions, plans, or intentions: "We will offer studios..."',
+    '  Observations without contact: "Studio owners charge $50/hour on average."',
+    '  Hypotheses or assumptions: "I believe photographers need..."',
+    '  Future plans: "We plan to talk to customers next month."',
+    '  Industry knowledge without direct contact: "I\'ve read that the market is..."',
+    '  Absence statements: "I haven\'t spoken with studio owners yet."',
+    '  Hedged or partial contact: "I haven\'t formally interviewed them yet."',
+    '',
+    'DEFAULT: false for every category where the founder did not explicitly state direct past contact THIS TURN.',
+    'Note: category_has_external_contact is per-turn. Stickiness across turns is handled by the system.',
     '',
     `Startup: ${startupName}`,
   ]
@@ -419,6 +806,11 @@ export function buildMemoryExtractionSystemPrompt(
       'If a category is NOT discussed in the recent messages, OUTPUT ITS CURRENT SCORE unchanged.',
       'Only change a score when the recent conversation adds new evidence or a clear contradiction.',
       '',
+      'PIVOT EXCEPTION: If pivot_detected = true this turn, you MAY reduce confidence scores',
+      'to reflect that the direction has genuinely changed. A real pivot invalidates prior',
+      'evidence in the pivoted categories. Apply judgment — only reduce scores for categories',
+      'directly affected by the direction change.',
+      '',
       existingMemory.problem   ? `Known problem: ${existingMemory.problem}`   : '',
       existingMemory.customer  ? `Known customer: ${existingMemory.customer}` : '',
       existingMemory.business_model ? `Known model: ${existingMemory.business_model}` : '',
@@ -432,6 +824,7 @@ export function buildMemoryExtractionSystemPrompt(
       `  competition: ${conf.competition}%`,
       `  risks: ${conf.risks}%`,
       `  founder_fit: ${conf.founder_fit}%`,
+      `  supply_side: ${conf.supply_side}%`,
     )
   }
 

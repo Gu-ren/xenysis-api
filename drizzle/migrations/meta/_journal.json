@@ -36,6 +36,34 @@
       "when": 1781460177272,
       "tag": "0004_brown_forge",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1750118400000,
+      "tag": "0005_founder_stage",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1750204800000,
+      "tag": "0006_marketplace_detection",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1750291200000,
+      "tag": "0007_supply_side",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1750377600000,
+      "tag": "0008_workspace_waitlist",
+      "breakpoints": true
     }
   ]
 }
