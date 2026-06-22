@@ -272,6 +272,12 @@ export const FounderUnderstandingSchema = z.object({
 
   // v2.1 F4: lifetime accumulator — increments each turn pivotDetected = true.
   pivotCount: z.number().int().min(0).default(0),
+
+  // Beta early-exit path: true when required categories are sufficiently understood
+  // (problem/customer/solution >= 50%, overall >= 70%, min exchanges met) but isComplete = false.
+  // Surfaces a founder-facing choice to generate an initial assessment now or continue discovery.
+  // Computed by the understanding engine — never set by extraction or stored independently.
+  earlyExitEligible: z.boolean().default(false),
 })
 export type FounderUnderstanding = z.infer<typeof FounderUnderstandingSchema>
 
@@ -676,6 +682,9 @@ export function buildUnderstanding(params: {
     marketplaceDetected,
     pivotDetected,
     pivotCount,
+    // earlyExitEligible is computed in updateUnderstanding where messagesCount is available.
+    // buildUnderstanding always returns false; the engine patches the real value before persisting.
+    earlyExitEligible: false,
   }
 }
 
@@ -723,6 +732,7 @@ export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
   marketplaceDetected: false,
   pivotDetected:       false,
   pivotCount:          0,
+  earlyExitEligible:   false,
 }
 
 // ── UI progress model ─────────────────────────────────────────────────────────

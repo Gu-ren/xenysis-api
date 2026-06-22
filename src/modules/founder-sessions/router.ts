@@ -28,6 +28,7 @@ import {
   FounderUnderstandingSchema,
   FounderStageSchema,
   EMPTY_UNDERSTANDING,
+  UNDERSTANDING_CATEGORIES,
 } from '../../lib/contracts/founder-understanding.ts'
 import { logActivity, trackUsage, estimateTokens, fromOpenAI } from '../../agents/base/utils.ts'
 import { updateUnderstanding, loadUnderstanding } from '../../services/understanding-engine.ts'
@@ -608,5 +609,112 @@ founderSessionsRouter.post(
         'X-Accel-Buffering': 'no',
       },
     )
+  },
+)
+
+// POST /api/v1/startups/:id/sessions/:sessionId/request-assessment
+// Beta early-exit path: founder elects to generate an assessment before natural completion.
+// Validates earlyExitEligible, forces session to completed with blueprintMode = 'hypothesis',
+// and computes generous gapsInBlueprint so all unvalidated areas are clearly labeled downstream.
+founderSessionsRouter.post(
+  '/:id/sessions/:sessionId/request-assessment',
+  requireAuth,
+  zValidator('param', sessionIdParam),
+  async (c) => {
+    const { id: startupId, sessionId } = c.req.valid('param')
+    const userId = c.var.user.id
+
+    await requireStartupOwner(startupId, userId)
+    const session = await requireSessionOwner(sessionId, startupId, userId)
+
+    if (session.status !== 'active') {
+      throw new BusinessRuleError('Session is no longer active')
+    }
+
+    const understanding = await loadUnderstanding(db, sessionId)
+
+    if (!understanding.earlyExitEligible) {
+      throw new BusinessRuleError(
+        'Session does not yet meet the minimum requirements for early assessment generation. ' +
+        'Problem, Customer, and Solution must each reach 50% confidence and overall understanding must reach 70%.',
+      )
+    }
+
+    // Force-complete the understanding with honest hypothesis framing.
+    // gapsInBlueprint covers all categories that lack confirmed external validation,
+    // so the blueprint agent labels them clearly as hypothesis sections.
+    const gapsInBlueprint = UNDERSTANDING_CATEGORIES.filter(
+      (cat) => understanding.categories[cat].validationStatus !== 'validated',
+    ) as typeof understanding.gapsInBlueprint
+
+    const forcedUnderstanding = {
+      ...understanding,
+      isComplete:        true,
+      blueprintMode:     'hypothesis' as const,
+      completionReason:  'founder_requested_early_exit',
+      gapsInBlueprint,
+      earlyExitEligible: false,
+      warnings:          understanding.warnings,
+    }
+
+    // Persist the forced-complete understanding.
+    const existingRow = await db.query.founderUnderstanding.findFirst({
+      where: eq(founderUnderstanding.sessionId, sessionId),
+    })
+
+    const upsertPayload = {
+      sessionId,
+      startupId,
+      userId,
+      isComplete:   true,
+      understanding: forcedUnderstanding,
+      updatedAt:    new Date(),
+    }
+
+    if (existingRow) {
+      await db
+        .update(founderUnderstanding)
+        .set(upsertPayload)
+        .where(eq(founderUnderstanding.sessionId, sessionId))
+    } else {
+      await db.insert(founderUnderstanding).values(upsertPayload)
+    }
+
+    // Close the session.
+    const durationSeconds = Math.round(
+      (Date.now() - session.createdAt.getTime()) / 1000,
+    )
+    await db
+      .update(founderSessions)
+      .set({
+        status:                 'completed',
+        sessionDurationSeconds: durationSeconds,
+        updatedAt:              new Date(),
+      })
+      .where(eq(founderSessions.id, sessionId))
+
+    await logActivity(db, {
+      userId,
+      startupId,
+      type:        'session.completed',
+      description: `Founder session completed via early exit for startup ${startupId}`,
+      meta: {
+        sessionId,
+        earlyExit:         true,
+        founderStage:      session.founderStage ?? 'building',
+        blueprintMode:     'hypothesis',
+        overallConfidence: understanding.overallConfidence,
+        messagesCount:     session.messagesCount,
+        durationSeconds,
+        gapsInBlueprint,
+        requiredConfidence: {
+          problem:  understanding.categories.problem.confidence,
+          customer: understanding.categories.customer.confidence,
+          solution: understanding.categories.solution.confidence,
+        },
+      },
+    })
+
+    return c.json({ data: { understanding: forcedUnderstanding } }, 200)
   },
 )

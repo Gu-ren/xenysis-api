@@ -202,6 +202,19 @@ export async function updateUnderstanding(
     }
   }
 
+  // Beta early-exit eligibility — secondary path that surfaces a founder-facing choice when
+  // Xenysis has foundational understanding but the session has not yet naturally completed.
+  // Criteria: required categories at partial confidence + overall floor + exchange minimum.
+  const earlyExitEligible = (
+    !understanding.isComplete &&
+    understanding.categories.problem.confidence  >= 50 &&
+    understanding.categories.customer.confidence >= 50 &&
+    understanding.categories.solution.confidence >= 50 &&
+    understanding.overallConfidence >= 70 &&
+    messagesCount >= MIN_EXCHANGES[founderStage]
+  )
+  understanding = { ...understanding, earlyExitEligible }
+
   // Determine evidence items that are new this turn.
   const newEvidenceByCategory: Partial<Record<UnderstandingCategory, string[]>> = {}
   for (const cat of UNDERSTANDING_CATEGORIES) {
