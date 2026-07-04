@@ -1,4 +1,4 @@
-CREATE TABLE "workspace_waitlist" (
+CREATE TABLE IF NOT EXISTS "workspace_waitlist" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"user_id" uuid NOT NULL,
 	"startup_id" uuid NOT NULL,
