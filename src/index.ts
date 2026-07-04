@@ -70,8 +70,8 @@ app.notFound((c) => {
 
 const port = Number(process.env.PORT ?? 3001)
 
-serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`[xenysis-api] Listening on http://localhost:${info.port}`)
+serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
+  console.log(`[xenysis-api] Listening on http://0.0.0.0:${info.port}`)
 })
 
 export { app }

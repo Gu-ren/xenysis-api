@@ -2,27 +2,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
 import type { HonoEnv } from '../../src/types/hono.ts'
 import {
-  makeUser,
   makeStartup,
   makeSession,
   makeAnswer,
   TEST_STARTUP_ID,
   TEST_SESSION_ID,
+  authHeaders,
 } from '../helpers/test-utils.ts'
 import { errorResponse } from '../../src/middleware/errors.ts'
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
-
-vi.mock('@supabase/supabase-js', () => ({
-  createClient: vi.fn(() => ({
-    auth: {
-      getUser: vi.fn().mockResolvedValue({
-        data: { user: makeUser() },
-        error: null,
-      }),
-    },
-  })),
-}))
 
 const mockStartupFindFirst = vi.fn()
 const mockSessionFindFirst = vi.fn()
@@ -56,7 +45,7 @@ function buildApp() {
   return app
 }
 
-const AUTH = { Authorization: 'Bearer valid-token' }
+const AUTH = await authHeaders()
 
 // ── POST /sessions ─────────────────────────────────────────────────────────────
 

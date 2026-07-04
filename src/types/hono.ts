@@ -1,7 +1,7 @@
-import type { User } from '@supabase/supabase-js'
+import type { AuthUser } from './auth.ts'
 
 export type HonoEnv = {
   Variables: {
-    user: User
+    user: AuthUser
   }
 }

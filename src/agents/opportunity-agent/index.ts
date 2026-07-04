@@ -7,7 +7,7 @@ import {
 } from '../base/events.ts'
 import { trackUsage } from '../base/utils.ts'
 import { getAdapter } from '../../lib/ai/adapters/index.ts'
-import { OpportunityAssessmentContentSchema } from '../../lib/contracts/opportunity-assessment.ts'
+import { OpportunityAssessmentContentSchema, computeOpportunityScoreFromBreakdown } from '../../lib/contracts/opportunity-assessment.ts'
 import type { OpportunityAssessmentContent } from '../../lib/contracts/opportunity-assessment.ts'
 import {
   buildSystemPrompt,
@@ -104,22 +104,11 @@ export class OpportunityAgent implements Agent<OpportunityAgentInput, Opportunit
 
     // ── Score arithmetic enforcement ─────────────────────────────────────────
     // The LLM is instructed to set opportunityScore equal to the weighted sum
-    // of scoreBreakdown dimensions. We verify this deterministically and correct
-    // any deviation. Chosen behavior: log a warning and use the computed value —
-    // deterministic arithmetic is more trustworthy than LLM rounding.
+    // of scoreBreakdown dimensions. Derive it deterministically when breakdown
+    // is present — sub-dimension scores are more reliable than top-level rounding.
     if (content.scoreBreakdown) {
-      const { problemStrength, customerClarity, marketPotential, competitiveAdvantage, founderFit } = content.scoreBreakdown
-      const computedScore = Math.round(
-        problemStrength.score      * 0.25 +
-        customerClarity.score      * 0.25 +
-        marketPotential.score      * 0.20 +
-        competitiveAdvantage.score * 0.15 +
-        founderFit.score           * 0.15,
-      )
+      const computedScore = computeOpportunityScoreFromBreakdown(content.scoreBreakdown)
       if (computedScore !== content.opportunityScore) {
-        console.warn(
-          `[OpportunityAgent] opportunityScore mismatch: LLM=${content.opportunityScore} computed=${computedScore} — correcting to computed value`,
-        )
         content = { ...content, opportunityScore: computedScore }
       }
     }

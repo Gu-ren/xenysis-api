@@ -7,7 +7,8 @@ import type { DB } from '../../src/lib/db/index.ts'
 import type { EvidenceRecordRow } from '../../src/lib/db/schema/understanding.ts'
 import type { OpportunityAgentInput } from '../../src/agents/opportunity-agent/input-contract.ts'
 import type { OpportunityAgentOutput } from '../../src/agents/opportunity-agent/types.ts'
-import type { OpportunityAssessmentContent } from '../../src/lib/contracts/opportunity-assessment.ts'
+import type { OpportunityAssessmentContent, ScoreBreakdown } from '../../src/lib/contracts/opportunity-assessment.ts'
+import { computeOpportunityScoreFromBreakdown } from '../../src/lib/contracts/opportunity-assessment.ts'
 import { EMPTY_FOUNDER_MEMORY } from '../../src/lib/contracts/founder-memory.ts'
 import { EMPTY_UNDERSTANDING } from '../../src/lib/contracts/founder-understanding.ts'
 import {
@@ -137,6 +138,31 @@ function makeValidAssessmentContent(
       ],
     },
     ...overrides,
+  }
+}
+
+function makeScoreDimension(score: number, weight: number) {
+  return {
+    score,
+    weight,
+    rationale: 'Test rationale for dimension scoring.',
+    tier:      'assumption_based' as const,
+  }
+}
+
+function makeScoreBreakdown(scores: {
+  problemStrength?: number
+  customerClarity?: number
+  marketPotential?: number
+  competitiveAdvantage?: number
+  founderFit?: number
+} = {}): ScoreBreakdown {
+  return {
+    problemStrength:      makeScoreDimension(scores.problemStrength ?? 62, 25),
+    customerClarity:      makeScoreDimension(scores.customerClarity ?? 62, 25),
+    marketPotential:      makeScoreDimension(scores.marketPotential ?? 62, 20),
+    competitiveAdvantage: makeScoreDimension(scores.competitiveAdvantage ?? 62, 15),
+    founderFit:           makeScoreDimension(scores.founderFit ?? 62, 15),
   }
 }
 
@@ -457,6 +483,44 @@ describe('OpportunityAgent', () => {
       } catch { /* expected */ }
 
       expect(mockTrackUsage).toHaveBeenCalledOnce()
+    })
+  })
+
+  // ── 4b. Score breakdown enforcement ─────────────────────────────────────────
+  describe('score breakdown enforcement', () => {
+    it('corrects opportunityScore to the weighted sum when LLM arithmetic drifts', async () => {
+      const breakdown = makeScoreBreakdown()
+      const content = makeValidAssessmentContent({
+        _schemaVersion:   '2.0',
+        opportunityScore: 64,
+        scoreBreakdown:   breakdown,
+      })
+      mockComplete.mockResolvedValue(makeAdapterResult(content))
+
+      const { result } = await consumeAgent(makeCtx())
+
+      expect(computeOpportunityScoreFromBreakdown(breakdown)).toBe(62)
+      expect(result.content.opportunityScore).toBe(62)
+      expect(mockPersistAssessment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: expect.objectContaining({ opportunityScore: 62 }),
+        }),
+      )
+    })
+
+    it('leaves opportunityScore unchanged when it already matches the breakdown', async () => {
+      const breakdown = makeScoreBreakdown({ problemStrength: 80, customerClarity: 70, marketPotential: 65, competitiveAdvantage: 60, founderFit: 55 })
+      const expected = computeOpportunityScoreFromBreakdown(breakdown)
+      const content = makeValidAssessmentContent({
+        _schemaVersion:   '2.0',
+        opportunityScore: expected,
+        scoreBreakdown:   breakdown,
+      })
+      mockComplete.mockResolvedValue(makeAdapterResult(content))
+
+      const { result } = await consumeAgent(makeCtx())
+
+      expect(result.content.opportunityScore).toBe(expected)
     })
   })
 })
