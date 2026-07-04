@@ -123,6 +123,12 @@ export type BlueprintMode = z.infer<typeof BlueprintModeSchema>
 export const THRESHOLD_COMPLETE   = 80   // building / revenue stage (and evidence floor)
 export const THRESHOLD_HYPOTHESIS = 60   // idea stage only
 
+// Early-exit / assessment gate thresholds (two-tier).
+export const EARLY_EXIT_INITIAL_REQUIRED_THRESHOLD  = THRESHOLD_COMPLETE  // 80
+export const EARLY_EXIT_INITIAL_OVERALL_THRESHOLD   = THRESHOLD_COMPLETE  // 80
+export const EARLY_EXIT_RETRIGGER_REQUIRED_THRESHOLD = 90
+export const EARLY_EXIT_RETRIGGER_OVERALL_THRESHOLD  = 90
+
 // Per-strength confidence ceilings applied only inside checkCompletion.
 // They are not stored, not shown in the UI, and do not affect the OA layer.
 // The design intent: a founder with strength-1 (pure assumption) cannot cross either
@@ -273,11 +279,13 @@ export const FounderUnderstandingSchema = z.object({
   // v2.1 F4: lifetime accumulator — increments each turn pivotDetected = true.
   pivotCount: z.number().int().min(0).default(0),
 
-  // Beta early-exit path: true when required categories are sufficiently understood
-  // (problem/customer/solution >= 50%, overall >= 70%, min exchanges met) but isComplete = false.
-  // Surfaces a founder-facing choice to generate an initial assessment now or continue discovery.
-  // Computed by the understanding engine — never set by extraction or stored independently.
+  // Beta early-exit path: true when required categories meet the tier threshold
+  // (80% first / 90% after Continue Discovery dismiss) and min exchanges are met.
+  // Computed by the understanding engine — never set by extraction alone.
   earlyExitEligible: z.boolean().default(false),
+
+  // Set when founder clicks Continue Discovery — raises re-trigger threshold to 90%.
+  earlyExitDismissed: z.boolean().default(false),
 })
 export type FounderUnderstanding = z.infer<typeof FounderUnderstandingSchema>
 
@@ -297,6 +305,30 @@ export function confidenceToStatus(confidence: number): CategoryStatus {
   if (confidence >= THRESHOLD_COMPLETE) return 'complete'
   if (confidence >= THRESHOLD_PARTIAL)  return 'partial'
   return 'missing'
+}
+
+/** Whether the founder may generate an early assessment or see the discovery gate. */
+export function computeEarlyExitEligible(
+  understanding: Pick<
+    FounderUnderstanding,
+    'isComplete' | 'categories' | 'overallConfidence' | 'earlyExitDismissed'
+  >,
+): boolean {
+  if (understanding.isComplete) return false
+
+  const requiredThreshold = understanding.earlyExitDismissed
+    ? EARLY_EXIT_RETRIGGER_REQUIRED_THRESHOLD
+    : EARLY_EXIT_INITIAL_REQUIRED_THRESHOLD
+  const overallThreshold = understanding.earlyExitDismissed
+    ? EARLY_EXIT_RETRIGGER_OVERALL_THRESHOLD
+    : EARLY_EXIT_INITIAL_OVERALL_THRESHOLD
+
+  return (
+    understanding.categories.problem.confidence  >= requiredThreshold &&
+    understanding.categories.customer.confidence >= requiredThreshold &&
+    understanding.categories.solution.confidence >= requiredThreshold &&
+    understanding.overallConfidence >= overallThreshold
+  )
 }
 
 // Weighted average using CATEGORY_IMPORTANCE.
@@ -683,8 +715,8 @@ export function buildUnderstanding(params: {
     pivotDetected,
     pivotCount,
     // earlyExitEligible is computed in updateUnderstanding where messagesCount is available.
-    // buildUnderstanding always returns false; the engine patches the real value before persisting.
     earlyExitEligible: false,
+    earlyExitDismissed: false,
   }
 }
 
@@ -733,6 +765,7 @@ export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
   pivotDetected:       false,
   pivotCount:          0,
   earlyExitEligible:   false,
+  earlyExitDismissed:  false,
 }
 
 // ── UI progress model ─────────────────────────────────────────────────────────

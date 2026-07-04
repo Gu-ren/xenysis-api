@@ -24,7 +24,7 @@ import {
   requiresAnswerChoices,
 } from './chat-prompt.ts'
 import { parseAnswerChoices, stripAnswerChoicesBlock } from './answer-choices.ts'
-import { generateAnswerChoicesFallback } from './answer-choices-fallback.ts'
+import { generateAnswerChoices, generateAnswerChoicesFallback } from './answer-choices-fallback.ts'
 import { FounderMemorySchema, EMPTY_FOUNDER_MEMORY, mergeFounderMemory, type FounderMemory } from '../../lib/contracts/founder-memory.ts'
 import { SessionSummarySchema } from '../../lib/contracts/session-summary.ts'
 import {
@@ -32,6 +32,9 @@ import {
   FounderStageSchema,
   EMPTY_UNDERSTANDING,
   UNDERSTANDING_CATEGORIES,
+  computeEarlyExitEligible,
+  EARLY_EXIT_INITIAL_REQUIRED_THRESHOLD,
+  EARLY_EXIT_RETRIGGER_REQUIRED_THRESHOLD,
 } from '../../lib/contracts/founder-understanding.ts'
 import { logActivity, trackUsage, estimateTokens, fromOpenAI } from '../../agents/base/utils.ts'
 import { updateUnderstanding, loadUnderstanding } from '../../services/understanding-engine.ts'
@@ -96,6 +99,59 @@ const addAnswerBody = z.object({
 const sendMessageBody = z.object({
   message: z.string().min(1).max(2000),
 })
+
+const generateChoicesBody = z.object({
+  questionText: z.string().min(10).max(4000),
+})
+
+async function loadChoicesContext(
+  sessionId: string,
+  startup: { name: string; description?: string | null },
+) {
+  const [latestSummaryRow, recentAnswers, existingMemoryRow, understandingRow] = await Promise.all([
+    db.query.sessionSummaries.findFirst({
+      where:   eq(sessionSummaries.sessionId, sessionId),
+      orderBy: [desc(sessionSummaries.createdAt)],
+    }),
+    db
+      .select()
+      .from(sessionAnswers)
+      .where(eq(sessionAnswers.sessionId, sessionId))
+      .orderBy(asc(sessionAnswers.sequenceOrder)),
+    db.query.founderMemories.findFirst({
+      where: eq(founderMemories.sessionId, sessionId),
+    }),
+    db.query.founderUnderstanding.findFirst({
+      where: eq(founderUnderstanding.sessionId, sessionId),
+    }),
+  ])
+
+  const latestSummary = latestSummaryRow
+    ? (SessionSummarySchema.safeParse(latestSummaryRow.summary).data ?? null)
+    : null
+
+  const currentUnderstanding = understandingRow
+    ? (FounderUnderstandingSchema.safeParse(understandingRow.understanding).data ?? EMPTY_UNDERSTANDING)
+    : EMPTY_UNDERSTANDING
+
+  const founderMemory = existingMemoryRow
+    ? (FounderMemorySchema.safeParse(existingMemoryRow.memory).data ?? null)
+    : null
+
+  const recentExchanges = recentAnswers.slice(-5).map((a) => ({
+    question: a.question,
+    answer:   a.answer,
+  }))
+
+  return {
+    latestSummary,
+    currentUnderstanding,
+    founderMemory,
+    recentExchanges,
+    startupName:        startup.name,
+    startupDescription: startup.description ?? undefined,
+  }
+}
 
 // ── Ownership helpers ─────────────────────────────────────────────────────────
 
@@ -404,16 +460,26 @@ founderSessionsRouter.post(
             cleanResponse = parsed.text
             let choices = parsed.choices
 
-            if (choices.length === 0 && requiresAnswerChoices(currentUnderstanding)) {
-              const fallback = await generateAnswerChoicesFallback({
-                questionText:    cleanResponse,
-                startupName:     startup.name,
-                weakestCategory: currentUnderstanding.weakestCategory,
+            const atDiscoveryGate =
+              currentUnderstanding.earlyExitEligible && !currentUnderstanding.earlyExitDismissed
+
+            if (atDiscoveryGate) {
+              choices = []
+            } else if (choices.length === 0 && requiresAnswerChoices(currentUnderstanding)) {
+              const ctx = await loadChoicesContext(sessionId, startup)
+              const generated = await generateAnswerChoices({
+                questionText:       cleanResponse,
+                startupName:        ctx.startupName,
+                startupDescription: ctx.startupDescription,
+                weakestCategory:    ctx.currentUnderstanding.weakestCategory,
+                sessionSummary:     ctx.latestSummary,
+                founderMemory:      ctx.founderMemory,
+                recentExchanges:    ctx.recentExchanges,
               })
-              choices = fallback.choices
-              fallbackInputTokens  = fallback.inputTokens
-              fallbackOutputTokens = fallback.outputTokens
-              fallbackModel        = fallback.model
+              choices = generated.choices
+              fallbackInputTokens  = generated.inputTokens
+              fallbackOutputTokens = generated.outputTokens
+              fallbackModel        = generated.model
             }
 
             // Sprint 2.5: the done event initially emits without understanding state,
@@ -655,6 +721,121 @@ founderSessionsRouter.post(
   },
 )
 
+// POST /api/v1/startups/:id/sessions/:sessionId/continue-discovery
+founderSessionsRouter.post(
+  '/:id/sessions/:sessionId/continue-discovery',
+  requireAuth,
+  chatRateLimit,
+  zValidator('param', sessionIdParam),
+  async (c) => {
+    const { id: startupId, sessionId } = c.req.valid('param')
+    const userId = c.var.user.id
+
+    await requireStartupOwner(startupId, userId)
+    const session = await requireSessionOwner(sessionId, startupId, userId)
+
+    if (session.status !== 'active') {
+      throw new BusinessRuleError('Session is no longer active')
+    }
+
+    const understanding = await loadUnderstanding(db, sessionId)
+    if (understanding.isComplete) {
+      throw new BusinessRuleError('Session is already complete')
+    }
+
+    const parsedStage = FounderStageSchema.safeParse(session.founderStage)
+    const founderStage = parsedStage.success ? parsedStage.data : 'building'
+
+    const MIN_EXCHANGES: Record<string, number> = {
+      idea:     Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_IDEA     ?? 6),
+      building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 8),
+      revenue:  Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_REVENUE  ?? 6),
+    }
+
+    const patched = {
+      ...understanding,
+      earlyExitDismissed: true,
+    }
+    const earlyExitEligible =
+      computeEarlyExitEligible(patched) &&
+      (session.messagesCount ?? 0) >= MIN_EXCHANGES[founderStage]
+
+    const updatedUnderstanding = {
+      ...patched,
+      earlyExitEligible,
+    }
+
+    const existingRow = await db.query.founderUnderstanding.findFirst({
+      where: eq(founderUnderstanding.sessionId, sessionId),
+    })
+
+    const upsertPayload = {
+      sessionId,
+      startupId,
+      userId,
+      isComplete:   updatedUnderstanding.isComplete,
+      understanding: updatedUnderstanding,
+      updatedAt:    new Date(),
+    }
+
+    if (existingRow) {
+      await db
+        .update(founderUnderstanding)
+        .set(upsertPayload)
+        .where(eq(founderUnderstanding.sessionId, sessionId))
+    } else {
+      await db.insert(founderUnderstanding).values(upsertPayload)
+    }
+
+    return c.json({ data: { understanding: updatedUnderstanding } })
+  },
+)
+
+// POST /api/v1/startups/:id/sessions/:sessionId/generate-choices
+founderSessionsRouter.post(
+  '/:id/sessions/:sessionId/generate-choices',
+  requireAuth,
+  chatRateLimit,
+  zValidator('param', sessionIdParam),
+  zValidator('json', generateChoicesBody),
+  async (c) => {
+    const { id: startupId, sessionId } = c.req.valid('param')
+    const userId = c.var.user.id
+    const { questionText } = c.req.valid('json')
+
+    const startup = await requireStartupOwner(startupId, userId)
+    const session = await requireSessionOwner(sessionId, startupId, userId)
+
+    if (session.status !== 'active') {
+      throw new BusinessRuleError('Session is no longer active')
+    }
+
+    const ctx = await loadChoicesContext(sessionId, startup)
+    if (ctx.currentUnderstanding.isComplete) {
+      throw new BusinessRuleError('Session is already complete')
+    }
+
+    const result = await generateAnswerChoices({
+      questionText,
+      startupName:        ctx.startupName,
+      startupDescription: ctx.startupDescription,
+      weakestCategory:    ctx.currentUnderstanding.weakestCategory,
+      sessionSummary:     ctx.latestSummary,
+      founderMemory:      ctx.founderMemory,
+      recentExchanges:    ctx.recentExchanges,
+    })
+
+    await trackUsage(db, {
+      userId,
+      startupId,
+      usage:   { model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens },
+      purpose: 'chat',
+    })
+
+    return c.json({ data: { choices: result.choices } })
+  },
+)
+
 // POST /api/v1/startups/:id/sessions/:sessionId/request-assessment
 // Beta early-exit path: founder elects to generate an assessment before natural completion.
 // Validates earlyExitEligible, forces session to completed with blueprintMode = 'hypothesis',
@@ -677,9 +858,12 @@ founderSessionsRouter.post(
     const understanding = await loadUnderstanding(db, sessionId)
 
     if (!understanding.earlyExitEligible) {
+      const thresholdHint = understanding.earlyExitDismissed
+        ? `${EARLY_EXIT_RETRIGGER_REQUIRED_THRESHOLD}% after continuing discovery`
+        : `${EARLY_EXIT_INITIAL_REQUIRED_THRESHOLD}% initially`
       throw new BusinessRuleError(
         'Session does not yet meet the minimum requirements for early assessment generation. ' +
-        'Problem, Customer, and Solution must each reach 50% confidence and overall understanding must reach 70%.',
+        `Problem, Customer, and Solution must each reach ${thresholdHint} and overall understanding must match.`,
       )
     }
 

@@ -4,6 +4,7 @@ import {
   buildUnderstanding,
   detectWeakestCategory,
   computeOverallConfidence,
+  computeEarlyExitEligible,
   detectQuestioningMode,
   getEffectiveRequiredCategories,
   THRESHOLD_COMPLETE,
@@ -15,6 +16,7 @@ import {
   TOTAL_WEIGHT_BASE,
   TOTAL_WEIGHT_MARKETPLACE,
   CATEGORY_IMPORTANCE,
+  EMPTY_UNDERSTANDING,
   type UnderstandingCategory,
   type EvidenceStrength,
 } from '../../src/lib/contracts/founder-understanding.ts'
@@ -696,6 +698,54 @@ describe('mergeFounderMemory — marketplace_detected (v2.2 PR2)', () => {
     )
     expect(merged.multi_icp_detected).toBe(true)
     expect(merged.marketplace_detected).toBe(true)
+  })
+})
+
+// ── computeEarlyExitEligible ──────────────────────────────────────────────────
+
+function makeEarlyExitInput(
+  requiredConfidence: number,
+  overallConfidence: number,
+  earlyExitDismissed = false,
+) {
+  const categories = { ...EMPTY_UNDERSTANDING.categories }
+  for (const cat of REQUIRED_CATEGORIES) {
+    categories[cat] = { ...categories[cat], confidence: requiredConfidence }
+  }
+  return {
+    isComplete: false,
+    earlyExitDismissed,
+    overallConfidence,
+    categories,
+  }
+}
+
+describe('computeEarlyExitEligible', () => {
+  it('returns true at 80% when earlyExitDismissed is false', () => {
+    expect(computeEarlyExitEligible(makeEarlyExitInput(80, 80, false))).toBe(true)
+  })
+
+  it('returns false at 79% when earlyExitDismissed is false', () => {
+    expect(computeEarlyExitEligible(makeEarlyExitInput(79, 79, false))).toBe(false)
+  })
+
+  it('returns false at 85% when earlyExitDismissed is true (needs 90%)', () => {
+    expect(computeEarlyExitEligible(makeEarlyExitInput(85, 85, true))).toBe(false)
+  })
+
+  it('returns true at 90% when earlyExitDismissed is true', () => {
+    expect(computeEarlyExitEligible(makeEarlyExitInput(90, 90, true))).toBe(true)
+  })
+
+  it('returns false when session is already complete', () => {
+    const input = makeEarlyExitInput(90, 90, false)
+    expect(computeEarlyExitEligible({ ...input, isComplete: true })).toBe(false)
+  })
+
+  it('returns false when one required category is below threshold', () => {
+    const input = makeEarlyExitInput(80, 80, false)
+    input.categories.problem = { ...input.categories.problem, confidence: 79 }
+    expect(computeEarlyExitEligible(input)).toBe(false)
   })
 })
 
