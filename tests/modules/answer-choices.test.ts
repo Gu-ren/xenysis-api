@@ -1,17 +1,82 @@
 import { describe, it, expect } from 'vitest'
-import { parseAnswerChoices, stripAnswerChoicesBlock } from '../../src/modules/founder-sessions/answer-choices.ts'
+import {
+  parseAnswerChoices,
+  stripAnswerChoicesBlock,
+  normalizeAnswerChoices,
+} from '../../src/modules/founder-sessions/answer-choices.ts'
+
+describe('normalizeAnswerChoices', () => {
+  it('normalizes structured objects with label and text', () => {
+    const choices = normalizeAnswerChoices([
+      {
+        label: 'SMB finance teams',
+        text: 'Our primary buyer is a finance lead at a 20–100 person company still reconciling invoices in spreadsheets.',
+      },
+      {
+        label: 'Enterprise CFOs',
+        text: 'We target CFOs at mid-market firms with multi-entity accounting who need real-time visibility.',
+      },
+    ])
+
+    expect(choices).toHaveLength(2)
+    expect(choices[0]).toEqual({
+      label: 'SMB finance teams',
+      text: 'Our primary buyer is a finance lead at a 20–100 person company still reconciling invoices in spreadsheets.',
+    })
+  })
+
+  it('falls back plain strings to label + text', () => {
+    const choices = normalizeAnswerChoices([
+      'Small business owners managing invoices manually',
+    ])
+
+    expect(choices).toHaveLength(1)
+    expect(choices[0].text).toBe('Small business owners managing invoices manually')
+    expect(choices[0].label).toBe('Small business owners managing invoices manually')
+  })
+
+  it('caps at 3 choices', () => {
+    const choices = normalizeAnswerChoices([
+      { label: 'A', text: 'Answer A' },
+      { label: 'B', text: 'Answer B' },
+      { label: 'C', text: 'Answer C' },
+      { label: 'D', text: 'Answer D' },
+    ])
+
+    expect(choices).toHaveLength(3)
+  })
+
+  it('preserves long multi-sentence text in full', () => {
+    const longText =
+      'Our primary buyer is a finance lead at a 20–100 person company still reconciling invoices in spreadsheets. They feel the pain when month-end close takes 5+ days and errors create audit risk. The buying trigger is usually a failed audit or a new CFO mandate.'
+
+    const choices = normalizeAnswerChoices([{ label: 'SMB finance teams', text: longText }])
+    expect(choices[0].text).toBe(longText)
+  })
+})
 
 describe('parseAnswerChoices', () => {
-  it('extracts JSON choices and strips the block from text', () => {
+  it('extracts structured choices and strips the block from text', () => {
     const input = `Who is your primary customer?
 
 <answer_choices>
-["SMB finance teams", "Enterprise CFOs", "Freelance accountants"]
+[
+  {
+    "label": "SMB finance teams",
+    "text": "Our primary buyer is a finance lead at a 20–100 person company still reconciling invoices in spreadsheets."
+  },
+  {
+    "label": "Enterprise CFOs",
+    "text": "We target CFOs at mid-market firms with multi-entity accounting who need real-time visibility."
+  }
+]
 </answer_choices>`
 
     const { text, choices } = parseAnswerChoices(input)
     expect(text).toBe('Who is your primary customer?')
-    expect(choices).toEqual(['SMB finance teams', 'Enterprise CFOs', 'Freelance accountants'])
+    expect(choices).toHaveLength(2)
+    expect(choices[0].label).toBe('SMB finance teams')
+    expect(choices[1].label).toBe('Enterprise CFOs')
   })
 
   it('falls back to bullet parsing when JSON is invalid', () => {
@@ -24,7 +89,8 @@ describe('parseAnswerChoices', () => {
 
     const { text, choices } = parseAnswerChoices(input)
     expect(text).toBe('What problem are you solving?')
-    expect(choices).toEqual(['Manual invoice tracking', 'Late payment follow-ups'])
+    expect(choices).toHaveLength(2)
+    expect(choices[0].text).toBe('Manual invoice tracking')
   })
 
   it('returns empty choices when block is absent', () => {
@@ -36,7 +102,7 @@ describe('parseAnswerChoices', () => {
 
 describe('stripAnswerChoicesBlock', () => {
   it('removes an incomplete choices block during streaming', () => {
-    const partial = 'Question here?\n\n<answer_choices>\n["Option A"'
+    const partial = 'Question here?\n\n<answer_choices>\n[{"label":"Option A"'
     expect(stripAnswerChoicesBlock(partial)).toBe('Question here?')
   })
 })

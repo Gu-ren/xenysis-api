@@ -1,5 +1,44 @@
 const CHOICES_OPEN = '<answer_choices>'
 const CHOICES_CLOSE = '</answer_choices>'
+const MAX_CHOICES = 3
+const MAX_LABEL_LENGTH = 60
+
+export interface AnswerChoice {
+  label: string
+  text: string
+}
+
+function truncateLabel(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed.length <= MAX_LABEL_LENGTH) return trimmed
+  return `${trimmed.slice(0, MAX_LABEL_LENGTH - 1).trimEnd()}…`
+}
+
+export function normalizeAnswerChoices(raw: unknown[]): AnswerChoice[] {
+  const choices: AnswerChoice[] = []
+
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const text = item.trim()
+      if (!text) continue
+      choices.push({ label: truncateLabel(text), text })
+      continue
+    }
+
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>
+      const text = typeof record.text === 'string' ? record.text.trim() : ''
+      if (!text) continue
+      const label =
+        typeof record.label === 'string' && record.label.trim()
+          ? record.label.trim()
+          : truncateLabel(text)
+      choices.push({ label: truncateLabel(label), text })
+    }
+  }
+
+  return choices.slice(0, MAX_CHOICES)
+}
 
 /** Strip a complete or in-progress answer_choices block from streamed text. */
 export function stripAnswerChoicesBlock(text: string): string {
@@ -13,7 +52,7 @@ export function stripAnswerChoicesBlock(text: string): string {
 }
 
 /** Parse answer choices from a completed AI response. */
-export function parseAnswerChoices(content: string): { text: string; choices: string[] } {
+export function parseAnswerChoices(content: string): { text: string; choices: AnswerChoice[] } {
   const match = content.match(
     new RegExp(`${CHOICES_OPEN}\\s*([\\s\\S]*?)\\s*${CHOICES_CLOSE}`, 'i'),
   )
@@ -26,21 +65,16 @@ export function parseAnswerChoices(content: string): { text: string; choices: st
   try {
     const parsed = JSON.parse(raw) as unknown
     if (Array.isArray(parsed)) {
-      const choices = parsed
-        .filter((c): c is string => typeof c === 'string' && c.trim().length > 0)
-        .map((c) => c.trim())
-        .slice(0, 4)
-      return { text, choices }
+      return { text, choices: normalizeAnswerChoices(parsed) }
     }
   } catch {
     // fall through to bullet parsing
   }
 
-  const choices = raw
+  const bulletItems = raw
     .split('\n')
     .map((line) => line.replace(/^[-*•]\s*/, '').trim())
     .filter(Boolean)
-    .slice(0, 4)
 
-  return { text, choices }
+  return { text, choices: normalizeAnswerChoices(bulletItems) }
 }

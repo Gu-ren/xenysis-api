@@ -10,7 +10,7 @@ import {
   SATURATION_THRESHOLD,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.3' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.4' as const
 
 // ── Per-category focus guidance for the gap-aware system prompt ───────────────
 
@@ -58,17 +58,29 @@ export function buildChatSystemPrompt(
     '',
     'ANSWER CHOICES:',
     'When you ask a discovery question (NOT during session completion or closing summaries),',
-    'include 3–4 quick-reply answer choices the founder can select and refine in chat.',
-    'Base choices on what they have already shared — plausible starters, not leading answers.',
+    'include exactly 3 suggested answer choices the founder can select and refine in chat.',
+    'Each choice must be a grounded draft answer based on what they have already shared — not generic placeholders.',
     'Place this block at the very END of your response, after your question:',
     '',
     '<answer_choices>',
-    '["First plausible answer", "Second plausible answer", "Third plausible answer"]',
+    '[',
+    '  {',
+    '    "label": "SMB finance teams",',
+    '    "text": "Our primary buyer is a finance lead at a 20–100 person company still reconciling invoices in spreadsheets. They feel the pain when month-end close takes 5+ days and errors create audit risk."',
+    '  },',
+    '  {',
+    '    "label": "Enterprise CFOs",',
+    '    "text": "We target CFOs at mid-market firms with multi-entity accounting who need real-time visibility across subsidiaries. The trigger is usually a failed audit or a board mandate to cut close time in half."',
+    '  }',
+    ']',
     '</answer_choices>',
     '',
     'Answer choice rules:',
-    '- Use a valid JSON array of strings inside the tags.',
-    '- Keep each choice under 120 characters.',
+    '- Use a valid JSON array of objects, each with "label" and "text" fields.',
+    '- "label": short scannable headline, max 60 characters.',
+    '- "text": 2–3 sentence draft answer (200–400 characters) covering who, what pain, and why now.',
+    '- Ground each draft in specifics from the conversation — names, numbers, contexts the founder mentioned.',
+    '- Provide exactly 3 choices representing distinct plausible directions.',
     '- Do NOT include choices when the session is complete or you are only summarizing.',
     '- Do NOT include choices during pivot acknowledgment unless you end with a follow-up question.',
     '',
