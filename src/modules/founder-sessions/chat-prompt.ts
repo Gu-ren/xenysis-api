@@ -10,7 +10,7 @@ import {
   SATURATION_THRESHOLD,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.2' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.3' as const
 
 // ── Per-category focus guidance for the gap-aware system prompt ───────────────
 
@@ -55,6 +55,22 @@ export function buildChatSystemPrompt(
     '4. Ask like a VC drilling into an investment thesis — precise, probing, high-value.',
     '5. When the founder is vague, push for a concrete example or number.',
     '6. When a founder confirms they have not validated something, acknowledge it and move on.',
+    '',
+    'ANSWER CHOICES:',
+    'When you ask a discovery question (NOT during session completion or closing summaries),',
+    'include 3–4 quick-reply answer choices the founder can select and refine in chat.',
+    'Base choices on what they have already shared — plausible starters, not leading answers.',
+    'Place this block at the very END of your response, after your question:',
+    '',
+    '<answer_choices>',
+    '["First plausible answer", "Second plausible answer", "Third plausible answer"]',
+    '</answer_choices>',
+    '',
+    'Answer choice rules:',
+    '- Use a valid JSON array of strings inside the tags.',
+    '- Keep each choice under 120 characters.',
+    '- Do NOT include choices when the session is complete or you are only summarizing.',
+    '- Do NOT include choices during pivot acknowledgment unless you end with a follow-up question.',
     '',
     '--- STARTUP CONTEXT ---',
     `Name: ${startup.name}`,

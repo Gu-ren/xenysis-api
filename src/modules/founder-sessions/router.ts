@@ -22,6 +22,7 @@ import {
   buildChatSystemPrompt,
   buildMemoryExtractionSystemPrompt,
 } from './chat-prompt.ts'
+import { parseAnswerChoices, stripAnswerChoicesBlock } from './answer-choices.ts'
 import { FounderMemorySchema, EMPTY_FOUNDER_MEMORY, mergeFounderMemory, type FounderMemory } from '../../lib/contracts/founder-memory.ts'
 import { SessionSummarySchema } from '../../lib/contracts/session-summary.ts'
 import {
@@ -354,6 +355,8 @@ founderSessionsRouter.post(
         async start(controller) {
           const encoder      = new TextEncoder()
           let fullResponse   = ''
+          let cleanResponse  = ''
+          let lastVisibleLen = 0
           let inputTokens    = 0
           let outputTokens   = 0
           let usageModel     = 'gpt-4o'
@@ -378,7 +381,12 @@ founderSessionsRouter.post(
               const delta = chunk.choices[0]?.delta?.content ?? ''
               if (delta) {
                 fullResponse += delta
-                emit({ type: 'delta', data: { content: delta } })
+                const visibleText = stripAnswerChoicesBlock(fullResponse)
+                const visibleDelta = visibleText.slice(lastVisibleLen)
+                lastVisibleLen = visibleText.length
+                if (visibleDelta) {
+                  emit({ type: 'delta', data: { content: visibleDelta } })
+                }
               }
               if (chunk.usage) {
                 inputTokens  = chunk.usage.prompt_tokens    ?? 0
@@ -387,11 +395,15 @@ founderSessionsRouter.post(
               }
             }
 
+            const parsed = parseAnswerChoices(fullResponse)
+            cleanResponse = parsed.text
+            const { choices } = parsed
+
             // Sprint 2.5: the done event initially emits without understanding state,
             // then the side-effect block updates understanding and nothing re-emits
             // (the client polls GET /understanding for progress UI updates).
             // This keeps the stream fast and the side-effects non-blocking.
-            emit({ type: 'done', data: { jobId: job.id } })
+            emit({ type: 'done', data: { jobId: job.id, choices } })
 
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Stream error'
@@ -456,7 +468,7 @@ founderSessionsRouter.post(
                     },
                     ...historyMessages,
                     { role: 'user',      content: `<user_input>${message}</user_input>` },
-                    { role: 'assistant', content: fullResponse },
+                    { role: 'assistant', content: cleanResponse },
                   ],
                 })
 
@@ -501,7 +513,7 @@ founderSessionsRouter.post(
                   },
                   ...historyMessages.slice(-10),
                   { role: 'user',      content: `<user_input>${message}</user_input>` },
-                  { role: 'assistant', content: fullResponse },
+                  { role: 'assistant', content: cleanResponse },
                 ],
               })
 
