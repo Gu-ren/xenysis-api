@@ -1,4 +1,6 @@
 import { relations } from 'drizzle-orm'
+import { users, refreshTokens } from './users.ts'
+import { profiles } from './profiles.ts'
 import {
   blueprintVersions,
   blueprints,
@@ -17,6 +19,7 @@ import { startups } from './startups.ts'
 
 // ── Active schema exports ─────────────────────────────────────────────────────
 export * from './enums.ts'
+export * from './users.ts'
 export * from './profiles.ts'
 export * from './startups.ts'
 export * from './founder-sessions.ts'
@@ -25,6 +28,28 @@ export * from './understanding.ts'
 export * from './artifacts.ts'
 export * from './generation.ts'
 export * from './waitlist.ts'
+
+export const usersRelations = relations(users, ({ one, many }) => ({
+  profile: one(profiles, {
+    fields: [users.id],
+    references: [profiles.id],
+  }),
+  refreshTokens: many(refreshTokens),
+}))
+
+export const profilesRelations = relations(profiles, ({ one }) => ({
+  user: one(users, {
+    fields: [profiles.id],
+    references: [users.id],
+  }),
+}))
+
+export const refreshTokensRelations = relations(refreshTokens, ({ one }) => ({
+  user: one(users, {
+    fields: [refreshTokens.userId],
+    references: [users.id],
+  }),
+}))
 
 // ── Drizzle relations ─────────────────────────────────────────────────────────
 

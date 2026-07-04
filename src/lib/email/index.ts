@@ -14,6 +14,8 @@ function getResend(): Resend {
 
 const FROM_ADDRESS = process.env.EMAIL_FROM ?? 'Xenysis <noreply@xenysis.app>'
 
+export { getResend, FROM_ADDRESS }
+
 export interface WaitlistConfirmationParams {
   to: string
   startupName: string

@@ -5,10 +5,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     // Provide stub values for env vars required at module load time.
-    // Individual tests mock the Supabase client so these are never used in real calls.
+    // Individual tests mock the auth layer or use signed JWTs — these are defaults.
     env: {
-      SUPABASE_URL:              'https://test.supabase.co',
-      SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+      JWT_SECRET:                'test-jwt-secret-for-vitest-only-32chars',
       DATABASE_URL:              'postgresql://test:test@localhost:5432/test',
       // Prevents OpenAI/Anthropic constructors from throwing at module load time.
       // Individual tests mock the AI client so this key is never used in real calls.

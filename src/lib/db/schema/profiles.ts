@@ -1,10 +1,10 @@
 import { pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { users } from './users.ts'
 
-// References auth.users(id) ON DELETE CASCADE — FK enforced in migration SQL.
-// Drizzle cannot reference the auth schema directly, so the constraint lives
-// only in the migration file.
 export const profiles = pgTable('profiles', {
-  id: uuid('id').primaryKey(),
+  id: uuid('id')
+    .primaryKey()
+    .references(() => users.id, { onDelete: 'cascade' }),
   displayName: text('display_name'),
   avatarUrl: text('avatar_url'),
   onboardingCompletedAt: timestamp('onboarding_completed_at', {

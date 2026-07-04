@@ -2,12 +2,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
 import type { HonoEnv } from '../../src/types/hono.ts'
 import {
-  makeUser,
   makeStartup,
   makeSession,
   TEST_STARTUP_ID,
   TEST_SESSION_ID,
   TEST_USER_ID,
+  authHeaders,
 } from '../helpers/test-utils.ts'
 import { errorResponse } from '../../src/middleware/errors.ts'
 import {
@@ -140,17 +140,6 @@ const MOCK_AGENT_EVENTS = [
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
-vi.mock('@supabase/supabase-js', () => ({
-  createClient: vi.fn(() => ({
-    auth: {
-      getUser: vi.fn().mockResolvedValue({
-        data:  { user: makeUser() },
-        error: null,
-      }),
-    },
-  })),
-}))
-
 const mockStartupFindFirst    = vi.fn()
 const mockSessionFindFirst    = vi.fn()
 const mockAssessmentFindFirst = vi.fn()
@@ -201,7 +190,7 @@ function buildApp() {
   return app
 }
 
-const AUTH    = { Authorization: 'Bearer valid-token' }
+const AUTH    = await authHeaders()
 const BASE    = `/api/v1/startups/${TEST_STARTUP_ID}/opportunity`
 const BODY    = { sessionId: TEST_SESSION_ID }
 const HEADERS = { ...AUTH, 'Content-Type': 'application/json' }

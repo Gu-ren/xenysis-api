@@ -1,23 +1,40 @@
-import type { User } from '@supabase/supabase-js'
+import { SignJWT } from 'jose'
+import type { AuthUser } from '../../src/types/auth.ts'
+
+const encoder = new TextEncoder()
 
 export const TEST_USER_ID    = '00000000-0000-0000-0000-000000000001'
 export const TEST_STARTUP_ID = '00000000-0000-0000-0000-000000000002'
 export const TEST_SESSION_ID = '00000000-0000-0000-0000-000000000003'
 export const TEST_ANSWER_ID  = '00000000-0000-0000-0000-000000000004'
 
-/** Minimal Supabase User stub for auth tests. */
-export function makeUser(overrides: Partial<User> = {}): User {
+/** Minimal auth user stub for tests. */
+export function makeUser(overrides: Partial<AuthUser> = {}): AuthUser {
   return {
     id: TEST_USER_ID,
-    app_metadata: {},
-    user_metadata: {},
-    aud: 'authenticated',
-    created_at: new Date().toISOString(),
     email: 'test@example.com',
-    role: 'authenticated',
-    updated_at: new Date().toISOString(),
     ...overrides,
-  } as User
+  }
+}
+
+export async function signTestAccessToken(
+  overrides: Partial<AuthUser> = {},
+): Promise<string> {
+  const user = makeUser(overrides)
+  const secret = process.env.JWT_SECRET ?? 'test-jwt-secret-for-vitest-only-32chars'
+
+  return new SignJWT({ email: user.email, type: 'access' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setSubject(user.id)
+    .setIssuedAt()
+    .setExpirationTime('1h')
+    .sign(encoder.encode(secret))
+}
+
+export async function authHeaders(
+  overrides: Partial<AuthUser> = {},
+): Promise<Record<string, string>> {
+  return { Authorization: `Bearer ${await signTestAccessToken(overrides)}` }
 }
 
 /** A minimal Startup row shape for use in DB mocks. */

@@ -9,15 +9,32 @@ if (!process.env.DATABASE_URL) {
   process.exit(1)
 }
 
-const client = postgres(process.env.DATABASE_URL, { prepare: false })
+const client = postgres(process.env.DATABASE_URL)
 const db = drizzle(client, { schema })
 
-// Fixed test user UUID — must match a real user in your Supabase Auth table.
-// Replace with an actual user ID from your project's auth.users table.
+// Fixed test user — created in the users table when seeding.
 const TEST_USER_ID = process.env.SEED_USER_ID ?? '00000000-0000-0000-0000-000000000001'
+const TEST_USER_EMAIL = process.env.SEED_USER_EMAIL ?? 'seed@xenysis.test'
 
 async function seed() {
   console.log('🌱 Seeding database...\n')
+
+  await db
+    .insert(schema.users)
+    .values({
+      id: TEST_USER_ID,
+      email: TEST_USER_EMAIL,
+      passwordHash: null,
+      emailVerifiedAt: new Date(),
+    })
+    .onConflictDoNothing()
+
+  await db
+    .insert(schema.profiles)
+    .values({ id: TEST_USER_ID })
+    .onConflictDoNothing()
+
+  console.log(`✓ Ensured user + profile: ${TEST_USER_ID}`)
 
   // ── Startups ──────────────────────────────────────────────────────────────
 
