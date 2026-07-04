@@ -21,8 +21,10 @@ import {
   FOUNDER_MEMORY_EXTRACTION_SCHEMA,
   buildChatSystemPrompt,
   buildMemoryExtractionSystemPrompt,
+  requiresAnswerChoices,
 } from './chat-prompt.ts'
 import { parseAnswerChoices, stripAnswerChoicesBlock } from './answer-choices.ts'
+import { generateAnswerChoicesFallback } from './answer-choices-fallback.ts'
 import { FounderMemorySchema, EMPTY_FOUNDER_MEMORY, mergeFounderMemory, type FounderMemory } from '../../lib/contracts/founder-memory.ts'
 import { SessionSummarySchema } from '../../lib/contracts/session-summary.ts'
 import {
@@ -359,6 +361,9 @@ founderSessionsRouter.post(
           let lastVisibleLen = 0
           let inputTokens    = 0
           let outputTokens   = 0
+          let fallbackInputTokens  = 0
+          let fallbackOutputTokens = 0
+          let fallbackModel        = 'gpt-4o-mini'
           let usageModel     = 'gpt-4o'
 
           const emit = (payload: unknown) => {
@@ -397,7 +402,19 @@ founderSessionsRouter.post(
 
             const parsed = parseAnswerChoices(fullResponse)
             cleanResponse = parsed.text
-            const { choices } = parsed
+            let choices = parsed.choices
+
+            if (choices.length === 0 && requiresAnswerChoices(currentUnderstanding)) {
+              const fallback = await generateAnswerChoicesFallback({
+                questionText:    cleanResponse,
+                startupName:     startup.name,
+                weakestCategory: currentUnderstanding.weakestCategory,
+              })
+              choices = fallback.choices
+              fallbackInputTokens  = fallback.inputTokens
+              fallbackOutputTokens = fallback.outputTokens
+              fallbackModel        = fallback.model
+            }
 
             // Sprint 2.5: the done event initially emits without understanding state,
             // then the side-effect block updates understanding and nothing re-emits
@@ -426,6 +443,20 @@ founderSessionsRouter.post(
                 usage:           { model: usageModel, inputTokens, outputTokens },
                 purpose:         'chat',
               })
+
+              if (fallbackInputTokens > 0 || fallbackOutputTokens > 0) {
+                await trackUsage(db, {
+                  userId,
+                  startupId,
+                  generationJobId: job.id,
+                  usage:           {
+                    model:        fallbackModel,
+                    inputTokens:  fallbackInputTokens,
+                    outputTokens: fallbackOutputTokens,
+                  },
+                  purpose: 'chat',
+                })
+              }
 
               // 2. Mark job done + increment messages_count.
               const newCount = (session.messagesCount ?? 0) + 1

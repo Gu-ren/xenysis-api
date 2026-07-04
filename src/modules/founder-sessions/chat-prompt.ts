@@ -10,7 +10,15 @@ import {
   SATURATION_THRESHOLD,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.4' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.5' as const
+
+const VALIDATION_PLANNING_CHOICES_RULE =
+  'Include <answer_choices> with exactly 3 validation-planning draft answers the founder can select and refine.'
+
+/** Discovery turns require answer choices; closing messages do not. */
+export function requiresAnswerChoices(understanding: FounderUnderstanding): boolean {
+  return !understanding.isComplete
+}
 
 // ── Per-category focus guidance for the gap-aware system prompt ───────────────
 
@@ -82,7 +90,6 @@ export function buildChatSystemPrompt(
     '- Ground each draft in specifics from the conversation — names, numbers, contexts the founder mentioned.',
     '- Provide exactly 3 choices representing distinct plausible directions.',
     '- Do NOT include choices when the session is complete or you are only summarizing.',
-    '- Do NOT include choices during pivot acknowledgment unless you end with a follow-up question.',
     '',
     '--- STARTUP CONTEXT ---',
     `Name: ${startup.name}`,
@@ -219,6 +226,7 @@ export function buildChatSystemPrompt(
         'Which direction do you want to build on for this session?"',
         'Do NOT reset the conversation or re-ask questions you already covered.',
         'Once the founder confirms, continue from the confirmed direction.',
+        'If you end with a follow-up question, you MUST include <answer_choices> with exactly 3 draft answers.',
       )
     }
 
@@ -286,6 +294,7 @@ export function buildChatSystemPrompt(
         '2. Name the specific assumptions that remain unvalidated — be concrete.',
         '3. Clearly state that the session is not yet complete and what is still needed.',
         '4. Ask the founder which of the weaker areas they would like to explore next.',
+        '5. Include <answer_choices> with 3 drafts — one per weaker area the founder could explore next.',
         'Do NOT skip step 3. Do NOT offer an early assessment. Continue discovery.',
       )
     } else {
@@ -318,6 +327,7 @@ export function buildChatSystemPrompt(
             '  - "What is the biggest risk to your model if your assumptions about the supply side turn out to be wrong?"',
             'The goal is to move from assumption-collection into validation planning.',
             'Do NOT ask for more beliefs, expectations, or hypotheses about supply-side dynamics.',
+            VALIDATION_PLANNING_CHOICES_RULE,
           )
         } else {
           lines.push(
@@ -331,6 +341,7 @@ export function buildChatSystemPrompt(
             '  - "What is the fastest experiment you could run to test whether this is true?"',
             '  - "What is the biggest risk to your startup if this assumption turns out to be wrong?"',
             'The goal is to shift from assumption-collection into evidence generation and risk awareness.',
+            VALIDATION_PLANNING_CHOICES_RULE,
           )
         }
       } else {
@@ -361,6 +372,7 @@ export function buildChatSystemPrompt(
               '  - "What is the biggest risk to your model if your assumptions about the supply side turn out to be wrong?"',
               'The goal is to move from assumption-collection into validation planning.',
               'Do NOT ask for more beliefs, expectations, or hypotheses about supply-side dynamics.',
+              VALIDATION_PLANNING_CHOICES_RULE,
             )
           } else {
             lines.push(
@@ -415,6 +427,7 @@ export function buildChatSystemPrompt(
               '  - "What is the fastest experiment you could run to test whether this is true?"',
               '  - "What is the biggest risk to your startup if this assumption turns out to be wrong?"',
               'The goal is to shift from assumption-collection into evidence generation and risk awareness.',
+              VALIDATION_PLANNING_CHOICES_RULE,
             )
           } else {
             // Category has confirmed absence of external evidence — ask understanding questions only.
@@ -443,6 +456,22 @@ export function buildChatSystemPrompt(
         }
       }
     }
+  }
+
+  if (requiresAnswerChoices(understanding)) {
+    lines.push(
+      '',
+      '--- CRITICAL — ANSWER CHOICES REQUIRED ---',
+      'Every response that asks the founder a question MUST end with <answer_choices>',
+      'containing exactly 3 JSON objects with "label" and "text" fields.',
+      'This is non-negotiable for discovery turns. Missing choices is a failure.',
+    )
+  } else {
+    lines.push(
+      '',
+      '--- ANSWER CHOICES: DO NOT INCLUDE ---',
+      'This is a closing message. Do NOT include <answer_choices>.',
+    )
   }
 
   lines.push(

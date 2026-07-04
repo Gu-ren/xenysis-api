@@ -8,6 +8,32 @@ export interface AnswerChoice {
   text: string
 }
 
+export const ANSWER_CHOICES_SCHEMA = {
+  name: 'answer_choices',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      choices: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            label: { type: 'string' },
+            text:  { type: 'string' },
+          },
+          required: ['label', 'text'],
+          additionalProperties: false,
+        },
+        minItems: 3,
+        maxItems: 3,
+      },
+    },
+    required: ['choices'],
+    additionalProperties: false,
+  },
+} as const
+
 function truncateLabel(value: string): string {
   const trimmed = value.trim()
   if (trimmed.length <= MAX_LABEL_LENGTH) return trimmed
@@ -40,6 +66,57 @@ export function normalizeAnswerChoices(raw: unknown[]): AnswerChoice[] {
   return choices.slice(0, MAX_CHOICES)
 }
 
+function stripMarkdownFences(raw: string): string {
+  return raw
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim()
+}
+
+function removeTrailingCommas(json: string): string {
+  return json.replace(/,\s*([}\]])/g, '$1')
+}
+
+/** Try multiple strategies to extract a JSON array from raw choices content. */
+export function extractChoicesJson(raw: string): unknown[] | null {
+  const cleaned = stripMarkdownFences(raw.trim())
+
+  const attempts = [
+    cleaned,
+    removeTrailingCommas(cleaned),
+  ]
+
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt) as unknown
+      if (Array.isArray(parsed)) return parsed
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        Array.isArray((parsed as Record<string, unknown>).choices)
+      ) {
+        return (parsed as Record<string, unknown>).choices as unknown[]
+      }
+    } catch {
+      // try next strategy
+    }
+  }
+
+  const arrayMatch = cleaned.match(/\[[\s\S]*\]/)
+  if (arrayMatch) {
+    for (const attempt of [arrayMatch[0], removeTrailingCommas(arrayMatch[0])]) {
+      try {
+        const parsed = JSON.parse(attempt) as unknown
+        if (Array.isArray(parsed)) return parsed
+      } catch {
+        // try next
+      }
+    }
+  }
+
+  return null
+}
+
 /** Strip a complete or in-progress answer_choices block from streamed text. */
 export function stripAnswerChoicesBlock(text: string): string {
   const withoutComplete = text.replace(
@@ -61,14 +138,9 @@ export function parseAnswerChoices(content: string): { text: string; choices: An
   if (!match) return { text, choices: [] }
 
   const raw = match[1].trim()
-
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    if (Array.isArray(parsed)) {
-      return { text, choices: normalizeAnswerChoices(parsed) }
-    }
-  } catch {
-    // fall through to bullet parsing
+  const extracted = extractChoicesJson(raw)
+  if (extracted) {
+    return { text, choices: normalizeAnswerChoices(extracted) }
   }
 
   const bulletItems = raw

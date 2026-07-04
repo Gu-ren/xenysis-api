@@ -1,9 +1,42 @@
 import { describe, it, expect } from 'vitest'
+import { requiresAnswerChoices } from '../../src/modules/founder-sessions/chat-prompt.ts'
+import { EMPTY_UNDERSTANDING } from '../../src/lib/contracts/founder-understanding.ts'
 import {
   parseAnswerChoices,
   stripAnswerChoicesBlock,
   normalizeAnswerChoices,
+  extractChoicesJson,
 } from '../../src/modules/founder-sessions/answer-choices.ts'
+
+describe('requiresAnswerChoices', () => {
+  it('returns true when session is not complete', () => {
+    expect(requiresAnswerChoices(EMPTY_UNDERSTANDING)).toBe(true)
+  })
+
+  it('returns false when session is complete', () => {
+    expect(requiresAnswerChoices({ ...EMPTY_UNDERSTANDING, isComplete: true })).toBe(false)
+  })
+})
+
+describe('extractChoicesJson', () => {
+  it('parses markdown-fenced JSON array', () => {
+    const raw = '```json\n[{"label":"A","text":"Answer A"}]\n```'
+    const result = extractChoicesJson(raw)
+    expect(result).toHaveLength(1)
+  })
+
+  it('parses JSON with trailing commas', () => {
+    const raw = '[{"label":"A","text":"Answer A",},{"label":"B","text":"Answer B",},]'
+    const result = extractChoicesJson(raw)
+    expect(result).toHaveLength(2)
+  })
+
+  it('extracts choices from wrapper object', () => {
+    const raw = '{"choices":[{"label":"A","text":"Answer A"},{"label":"B","text":"Answer B"},{"label":"C","text":"Answer C"}]}'
+    const result = extractChoicesJson(raw)
+    expect(result).toHaveLength(3)
+  })
+})
 
 describe('normalizeAnswerChoices', () => {
   it('normalizes structured objects with label and text', () => {
@@ -53,6 +86,16 @@ describe('normalizeAnswerChoices', () => {
     const choices = normalizeAnswerChoices([{ label: 'SMB finance teams', text: longText }])
     expect(choices[0].text).toBe(longText)
   })
+
+  it('normalizes fallback schema wrapper with exactly 3 choices', () => {
+    const raw = extractChoicesJson(
+      '{"choices":[{"label":"A","text":"Draft A"},{"label":"B","text":"Draft B"},{"label":"C","text":"Draft C"}]}',
+    )
+    expect(raw).not.toBeNull()
+    const choices = normalizeAnswerChoices(raw!)
+    expect(choices).toHaveLength(3)
+    expect(choices[2].label).toBe('C')
+  })
 })
 
 describe('parseAnswerChoices', () => {
@@ -77,6 +120,25 @@ describe('parseAnswerChoices', () => {
     expect(choices).toHaveLength(2)
     expect(choices[0].label).toBe('SMB finance teams')
     expect(choices[1].label).toBe('Enterprise CFOs')
+  })
+
+  it('recovers markdown-fenced JSON inside answer_choices block', () => {
+    const input = `What is your revenue model?
+
+<answer_choices>
+\`\`\`json
+[
+  {"label": "SaaS subscription", "text": "We charge $99/month per seat for finance teams who need automated reconciliation."},
+  {"label": "Usage-based", "text": "We bill per invoice processed at $0.50 each for high-volume AP teams."},
+  {"label": "Enterprise license", "text": "Annual contracts starting at $50k for mid-market firms with multi-entity needs."}
+]
+\`\`\`
+</answer_choices>`
+
+    const { text, choices } = parseAnswerChoices(input)
+    expect(text).toBe('What is your revenue model?')
+    expect(choices).toHaveLength(3)
+    expect(choices[0].label).toBe('SaaS subscription')
   })
 
   it('falls back to bullet parsing when JSON is invalid', () => {
