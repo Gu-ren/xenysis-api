@@ -13,6 +13,7 @@ import {
   REQUIRED_CATEGORIES,
   UNDERSTANDING_CATEGORIES,
   SATURATION_THRESHOLD,
+  REQUIRED_SATURATION_THRESHOLD,
   TOTAL_WEIGHT_BASE,
   TOTAL_WEIGHT_MARKETPLACE,
   CATEGORY_IMPORTANCE,
@@ -463,16 +464,44 @@ describe('detectWeakestCategory — multiIcpDetected', () => {
     expect(result).toBe('customer')
   })
 
-  it('still blocks other saturated categories when multiIcpDetected is true', () => {
-    // problem is saturated, customer is not saturated but has low confidence.
-    // With multiIcpDetected=true, problem is still blocked; customer wins.
+  it('still prioritises required category below 80 over saturated supporting category when multiIcpDetected is true', () => {
+    // problem is required at 20% with saturation 3 — lenient threshold (5) keeps it active.
+    // competition is supporting and saturated — customer also low but not saturated.
     const confidence = makeConfidence(90)
     confidence.problem  = 20
     confidence.customer = 25
-    const saturation = makeSaturation('problem', SATURATION_THRESHOLD)
+    const saturation = { problem: SATURATION_THRESHOLD }
     const result = detectWeakestCategory(confidence, [], saturation, true)
-    // problem is saturated (not customer) → customer should win over saturated problem
+    expect(result).toBe('problem')
+  })
+
+  it('blocks required category when saturation reaches lenient threshold of 5', () => {
+    const confidence = makeConfidence(90)
+    confidence.problem  = 20
+    confidence.customer = 25
+    const saturation = { problem: REQUIRED_SATURATION_THRESHOLD }
+    const result = detectWeakestCategory(confidence, [], saturation, true)
     expect(result).toBe('customer')
+  })
+})
+
+describe('detectWeakestCategory — required category priority (v2.6)', () => {
+  it('prioritises required category below 80 despite focus cooling', () => {
+    const confidence = makeConfidence(85)
+    confidence.problem = 55
+    confidence.competition = 40
+    const focusHistory = ['problem', 'problem', 'problem']
+    const result = detectWeakestCategory(confidence, focusHistory, {})
+    expect(result).toBe('problem')
+  })
+
+  it('uses lenient saturation threshold for required category below 80', () => {
+    const confidence = makeConfidence(85)
+    confidence.customer = 50
+    const saturation = { customer: 4 }
+    const result = detectWeakestCategory(confidence, [], saturation)
+    expect(result).toBe('customer')
+    expect(4).toBeLessThan(REQUIRED_SATURATION_THRESHOLD)
   })
 })
 
@@ -882,6 +911,16 @@ describe('computeOverallConfidence — supply_side weight (v2.2 PR3)', () => {
 })
 
 describe('detectQuestioningMode — supply_side treated as done when not marketplace (v2.2 PR3)', () => {
+  it('stays in discovery when a required category is below 65% (v2.6 threshold)', () => {
+    const confidence = makeConfidence(75)
+    confidence.problem = 55
+    const result = buildUnderstanding({
+      ...minimalUnderstandingParams(75),
+      categoryConfidence: confidence,
+    })
+    expect(result.questioningMode).toBe('discovery')
+  })
+
   it('supply_side at 0 does NOT trigger gap_identification for non-marketplace sessions', () => {
     // Required + supporting categories all strong; supply_side = 0 — non-marketplace should reach gap_identification.
     // If supply_side were counted, the low confidence would block gap_identification mode.

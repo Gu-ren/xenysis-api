@@ -186,7 +186,7 @@ export async function updateUnderstanding(
   // These defaults are tunable via environment variables without redeployment.
   const MIN_EXCHANGES: Record<FounderStage, number> = {
     idea:     Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_IDEA     ?? 6),
-    building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 8),
+    building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 6),
     revenue:  Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_REVENUE  ?? 6),
   }
   if (understanding.isComplete && messagesCount < MIN_EXCHANGES[founderStage]) {

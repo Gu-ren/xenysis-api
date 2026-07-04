@@ -41,6 +41,9 @@ export type QuestioningMode = z.infer<typeof QuestioningModeSchema>
 // is treated as exhausted — blocked from further questioning regardless of focus-cooling state.
 export const SATURATION_THRESHOLD      = 3
 export const SATURATION_DELTA_THRESHOLD = 5   // minimum confidence change to reset saturation counter
+// Lenient saturation for required categories still below THRESHOLD_COMPLETE.
+export const REQUIRED_SATURATION_THRESHOLD       = 5
+export const REQUIRED_SATURATION_DELTA_THRESHOLD = 3
 
 // ── Category definition ───────────────────────────────────────────────────────
 
@@ -388,14 +391,29 @@ export function detectWeakestCategory(
     const effectiveImportance = (cat === 'supply_side' && marketplaceDetected)
       ? CATEGORY_IMPORTANCE[cat] + 2  // 11 — beats competition(10) and market(9) at low confidence
       : CATEGORY_IMPORTANCE[cat]
-    const basePriority = (100 - (categoryConfidence[cat] ?? 0)) * effectiveImportance
+    const confidence = categoryConfidence[cat] ?? 0
+    const isRequiredCat = (REQUIRED_CATEGORIES as readonly UnderstandingCategory[]).includes(cat)
+    const requiredBelow80 = isRequiredCat && confidence < THRESHOLD_COMPLETE
+    const anyRequiredBelow80 = REQUIRED_CATEGORIES.some(
+      (rc) => (categoryConfidence[rc] ?? 0) < THRESHOLD_COMPLETE,
+    )
+
+    let basePriority = (100 - confidence) * effectiveImportance
+    if (anyRequiredBelow80 && requiredBelow80) {
+      basePriority *= 2
+    }
+
     const recentCount  = Math.min(focusHistory.filter((h) => h === cat).length, 3)
-    const coolMult     = COOLING_MULTIPLIERS[recentCount] ?? 1.0
+    // Required categories below 80% are exempt from focus cooling — keep drilling until complete.
+    const coolMult     = (anyRequiredBelow80 && requiredBelow80)
+      ? 1.0
+      : (COOLING_MULTIPLIERS[recentCount] ?? 1.0)
     // Saturated categories get a near-zero multiplier — they are exhausted and should not
     // be selected again until a new evidence breakthrough resets the saturation counter.
     // Exception: customer saturation is suppressed when multiIcpDetected — marketplace
     // founders legitimately need continued customer exploration across both ICP segments.
-    const isSaturated  = (saturationCounts[cat] ?? 0) >= SATURATION_THRESHOLD
+    const satThreshold = requiredBelow80 ? REQUIRED_SATURATION_THRESHOLD : SATURATION_THRESHOLD
+    const isSaturated  = (saturationCounts[cat] ?? 0) >= satThreshold
     const satMult      = (isSaturated && !(cat === 'customer' && multiIcpDetected)) ? 0.02 : 1.0
     const effectivePriority = basePriority * coolMult * satMult
 
@@ -513,10 +531,10 @@ export function deriveAssessmentTier(
 
 // Determine session-level questioning mode.
 // Transitions to gap_identification when all categories have reached one of:
-//   - required categories: confidence >= 50 (partial or better)
-//   - supporting categories: confidence >= 60, or explicitly_unvalidated, or saturationCount >= SATURATION_THRESHOLD
-const QUESTIONING_MODE_REQUIRED_THRESHOLD  = 50
-const QUESTIONING_MODE_SUPPORTING_THRESHOLD = 60
+//   - required categories: confidence >= 65 (partial or better)
+//   - supporting categories: confidence >= 70, or explicitly_unvalidated, or saturationCount >= SATURATION_THRESHOLD
+const QUESTIONING_MODE_REQUIRED_THRESHOLD  = 65
+const QUESTIONING_MODE_SUPPORTING_THRESHOLD = 70
 
 export function detectQuestioningMode(
   categories: FounderUnderstanding['categories'],
@@ -635,8 +653,12 @@ export function buildUnderstanding(params: {
       // Saturation: increment when this category was targeted last turn and delta is small.
       const wasLastFocus    = lastFocusCat === cat
       const confDelta       = wasLastFocus ? Math.abs(confidence - lastFocusConf) : 0
+      const deltaThreshold  = (REQUIRED_CATEGORIES as readonly UnderstandingCategory[]).includes(cat)
+        && confidence < THRESHOLD_COMPLETE
+        ? REQUIRED_SATURATION_DELTA_THRESHOLD
+        : SATURATION_DELTA_THRESHOLD
       const newSatCount     = wasLastFocus
-        ? (confDelta < SATURATION_DELTA_THRESHOLD ? existingSat + 1 : 0)
+        ? (confDelta < deltaThreshold ? existingSat + 1 : 0)
         : existingSat
       const newLastFocusConf = wasLastFocus ? confidence : lastFocusConf
 

@@ -8,9 +8,12 @@ import {
   EMPTY_UNDERSTANDING,
   UNDERSTANDING_CATEGORIES,
   SATURATION_THRESHOLD,
+  REQUIRED_SATURATION_THRESHOLD,
+  REQUIRED_CATEGORIES,
+  THRESHOLD_COMPLETE,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.5' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.6' as const
 
 const VALIDATION_PLANNING_CHOICES_RULE =
   'Include <answer_choices> with exactly 3 validation-planning draft answers the founder can select and refine.'
@@ -34,6 +37,41 @@ const CATEGORY_FOCUS_GUIDANCE: Record<UnderstandingCategory, string> = {
   founder_fit:  'the founder\'s domain expertise, existing customer relationships, and what makes them uniquely positioned to win',
   // v2.2 PR3: supply-side probes provider acquisition, quality, and retention for marketplace startups.
   supply_side:  'how supply-side participants (providers, sellers, hosts, drivers) are recruited, onboarded, quality-controlled, and retained',
+}
+
+const CATEGORY_MUST_ELICIT: Record<UnderstandingCategory, string> = {
+  problem:      'pain frequency, current workaround, and cost of the status quo',
+  customer:     'job title, company size, and purchase trigger',
+  solution:     'core mechanism, why it beats the current workaround, and differentiation',
+  market:       'market size estimate, growth signal, and timing',
+  pricing:      'revenue model, price point, and willingness-to-pay signal',
+  competition:  'named alternatives and why customers would switch',
+  risks:        'biggest threat and key unproven assumption',
+  founder_fit:  'domain expertise, customer access, and execution track record',
+  supply_side:  'recruitment channel, onboarding flow, and quality control',
+}
+
+const REQUIRED_SPRINT_THRESHOLD = 60
+const REQUIRED_SPRINT_ORDER: UnderstandingCategory[] = ['problem', 'customer', 'solution']
+
+function getRequiredSprintCategory(
+  categories: FounderUnderstanding['categories'],
+): UnderstandingCategory | null {
+  for (const cat of REQUIRED_SPRINT_ORDER) {
+    if ((categories[cat]?.confidence ?? 0) < REQUIRED_SPRINT_THRESHOLD) return cat
+  }
+  return null
+}
+
+function getEffectiveSaturationThresholdForPrompt(
+  cat: UnderstandingCategory,
+  confidence: number,
+): number {
+  if ((REQUIRED_CATEGORIES as readonly UnderstandingCategory[]).includes(cat)
+    && confidence < THRESHOLD_COMPLETE) {
+    return REQUIRED_SATURATION_THRESHOLD
+  }
+  return SATURATION_THRESHOLD
 }
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -61,7 +99,7 @@ export function buildChatSystemPrompt(
     '2. Make each question specific and grounded in what the founder has already said.',
     '3. Do not repeat questions about categories you already understand well.',
     '4. Ask like a VC drilling into an investment thesis — precise, probing, high-value.',
-    '5. When the founder is vague, push for a concrete example or number.',
+    '5. When the founder is vague, your question MUST request one specific example or number — not a general restatement.',
     '6. When a founder confirms they have not validated something, acknowledge it and move on.',
     '',
     'ANSWER CHOICES:',
@@ -85,8 +123,8 @@ export function buildChatSystemPrompt(
     '',
     'Answer choice rules:',
     '- Use a valid JSON array of objects, each with "label" and "text" fields.',
-    '- "label": short scannable headline, max 60 characters.',
-    '- "text": 2–3 sentence draft answer (200–400 characters) covering who, what pain, and why now.',
+    '- "label": short scannable headline, max 60 characters — signal depth when useful (e.g. "With numbers", "With customer quote", "Hypothesis — needs validation").',
+    '- "text": 2–3 sentence draft answer (200–400 characters). Each draft MUST include: (1) a specific persona (role + segment), (2) a concrete trigger or example, (3) a quantified or bounded claim (frequency, cost, size, timeline).',
     '- Ground each draft in specifics from the conversation — names, numbers, contexts the founder mentioned.',
     '- Provide exactly 3 choices representing distinct plausible directions.',
     '- Do NOT include choices when the session is complete or you are only summarizing.',
@@ -174,9 +212,11 @@ export function buildChatSystemPrompt(
     const focusSaturated = UNDERSTANDING_CATEGORIES.filter(
       (cat) => focusHistory.filter((h) => h === cat).length >= 3,
     )
-    const statSaturated = UNDERSTANDING_CATEGORIES.filter(
-      (cat) => (understanding.categories[cat].saturationCount ?? 0) >= SATURATION_THRESHOLD,
-    )
+    const statSaturated = UNDERSTANDING_CATEGORIES.filter((cat) => {
+      const conf = understanding.categories[cat].confidence ?? 0
+      const threshold = getEffectiveSaturationThresholdForPrompt(cat, conf)
+      return (understanding.categories[cat].saturationCount ?? 0) >= threshold
+    })
     const allBlocked = [...new Set([...focusSaturated, ...statSaturated])]
     const effectiveBlockedCategories = understanding.multiIcpDetected
       ? allBlocked.filter((cat) => cat !== 'customer')
@@ -281,23 +321,68 @@ export function buildChatSystemPrompt(
         )
       }
     } else if (understanding.questioningMode === 'gap_identification') {
-      lines.push(
-        '',
-        '--- SESSION MODE: GAP IDENTIFICATION ---',
-        'The core areas are partially understood but the session is NOT yet complete.',
-        'Problem, Customer, and Solution must each reach 80% confidence before the session closes.',
-        'Do NOT tell the founder they can proceed to the Opportunity Assessment.',
-        'Do NOT imply the session is finished.',
-        'Do NOT offer any alternative path or early exit.',
-        'Instead, do all of the following in one response:',
-        '1. Briefly summarize what is known so far about the startup (2–3 sentences max).',
-        '2. Name the specific assumptions that remain unvalidated — be concrete.',
-        '3. Clearly state that the session is not yet complete and what is still needed.',
-        '4. Ask the founder which of the weaker areas they would like to explore next.',
-        '5. Include <answer_choices> with 3 drafts — one per weaker area the founder could explore next.',
-        'Do NOT skip step 3. Do NOT offer an early assessment. Continue discovery.',
+      const laggingRequired = REQUIRED_CATEGORIES.filter(
+        (cat) => (understanding.categories[cat]?.confidence ?? 0) < THRESHOLD_COMPLETE,
       )
+      if (laggingRequired.length > 0) {
+        const lowestRequired = laggingRequired.reduce((a, b) =>
+          (understanding.categories[a].confidence <= understanding.categories[b].confidence ? a : b),
+        )
+        const lowestState = understanding.categories[lowestRequired]
+        const focusGuide  = CATEGORY_FOCUS_GUIDANCE[lowestRequired]
+        const mustElicit  = CATEGORY_MUST_ELICIT[lowestRequired]
+        lines.push(
+          '',
+          '--- SESSION MODE: GAP IDENTIFICATION (REQUIRED CATEGORY STILL BELOW 80%) ---',
+          'Problem, Customer, and Solution must each reach 80% before the session closes.',
+          'Do NOT tell the founder they can proceed to the Opportunity Assessment.',
+          'Do NOT ask the founder to pick an area — auto-target the lowest required category.',
+          '',
+          '--- FOCUS INSTRUCTION ---',
+          `Lowest required area: ${CATEGORY_DISPLAY[lowestRequired].label} (${lowestState.confidence}% confidence).`,
+          `Your next question MUST investigate: ${focusGuide}.`,
+          `Must elicit in your question: ${mustElicit}.`,
+          'Request who, when, and a concrete example in a single question.',
+          'Ground your question in something the founder has already mentioned.',
+        )
+      } else {
+        lines.push(
+          '',
+          '--- SESSION MODE: GAP IDENTIFICATION ---',
+          'The core areas are partially understood but the session is NOT yet complete.',
+          'Problem, Customer, and Solution must each reach 80% confidence before the session closes.',
+          'Do NOT tell the founder they can proceed to the Opportunity Assessment.',
+          'Do NOT imply the session is finished.',
+          'Do NOT offer any alternative path or early exit.',
+          'Instead, do all of the following in one response:',
+          '1. Briefly summarize what is known so far about the startup (2–3 sentences max).',
+          '2. Name the specific assumptions that remain unvalidated — be concrete.',
+          '3. Clearly state that the session is not yet complete and what is still needed.',
+          '4. Ask the founder which of the weaker areas they would like to explore next.',
+          '5. Include <answer_choices> with 3 drafts — one per weaker area the founder could explore next.',
+          'Do NOT skip step 3. Do NOT offer an early assessment. Continue discovery.',
+        )
+      }
     } else {
+      const sprintCat = getRequiredSprintCategory(understanding.categories)
+      if (sprintCat !== null) {
+        const sprintState = understanding.categories[sprintCat]
+        const focusGuide  = CATEGORY_FOCUS_GUIDANCE[sprintCat]
+        const mustElicit  = CATEGORY_MUST_ELICIT[sprintCat]
+        lines.push(
+          '',
+          '--- REQUIRED CATEGORY SPRINT ---',
+          'Problem, Customer, and Solution must each reach at least 60% before exploring supporting areas.',
+          `Current sprint target: ${CATEGORY_DISPLAY[sprintCat].label} (${sprintState.confidence}% confidence).`,
+          'Do NOT ask about market, pricing, competition, risks, or founder_fit until all three required categories are at 60%+.',
+          '',
+          '--- FOCUS INSTRUCTION ---',
+          `Your next question MUST investigate: ${focusGuide}.`,
+          `Must elicit in your question: ${mustElicit}.`,
+          'In one question, request who feels this, when it happens, and a concrete example.',
+          'Ground your question in something the founder has already mentioned.',
+        )
+      } else {
       // Pre-scan: find any category where assumption-gathering is exhausted before routing
       // by weakest category. This decouples validation-planning from the focus-cooling selector,
       // which can displace a saturated category before the nested pivot condition is met.
@@ -450,12 +535,26 @@ export function buildChatSystemPrompt(
             '--- FOCUS INSTRUCTION ---',
             `Your weakest area is: ${categoryName} (${weakestState.confidence}% confidence, ${strengthLabel}).`,
             `Your next question MUST investigate: ${focusGuide}.`,
+            `Must elicit in your question: ${CATEGORY_MUST_ELICIT[weakest]}.`,
             'Ground your question in something the founder has already mentioned.',
             'Do NOT ask about categories where confidence is already above 80%.',
           )
         }
       }
+      }
     }
+  } else if (!understanding.isComplete) {
+    lines.push(
+      '',
+      '--- FOUNDATION KICKOFF (FIRST TURN) ---',
+      'This is the start of the discovery session. Ask one structured foundation question:',
+      '"In a few sentences — who has the problem, what pain they feel, and what you\'re building to solve it."',
+      'Do NOT ask a narrow single-category question yet.',
+      '',
+      'Your <answer_choices> MUST be 3 full-paragraph seeds, each covering ALL THREE dimensions:',
+      '  (1) who has the problem / target customer, (2) the specific pain, (3) what they are building.',
+      'Each draft should represent a distinct plausible startup direction grounded in their idea.',
+    )
   }
 
   if (requiresAnswerChoices(understanding)) {
@@ -673,6 +772,13 @@ export function buildMemoryExtractionSystemPrompt(
     '  30-59 = Partial. Mentioned but key specifics are absent.',
     '  60-79 = Good. Core facts known; some depth missing.',
     '  80-100 = Complete. Well understood with specific, credible evidence.',
+    '',
+    'STRUCTURED-ANSWER RECOGNITION (required categories: problem, customer, solution):',
+    'When a single founder turn provides a rich, structured answer, score generously and route to category_evidence.',
+    '  - Persona + trigger/example + workaround/mechanism for one required category → score 60–75 (not 30–45).',
+    '  - Same turn also includes a quantified claim or named segment → allow 75–85 if specifics are credible.',
+    '  - Extract each distinct factual claim into category_evidence[] so confidence can update.',
+    '  - Do NOT route positive factual claims to category_absence_signals — they belong in category_evidence.',
     '',
     'IMPORTANT: Confidence is a LIVING score. If the founder contradicts earlier statements',
     'or reveals an assumption was wrong, lower the confidence for that category accordingly.',

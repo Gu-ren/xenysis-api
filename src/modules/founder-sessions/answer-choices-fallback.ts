@@ -86,9 +86,11 @@ export async function generateAnswerChoices(
         role:    'system',
         content: [
           'Generate exactly 3 suggested answer choices for a founder discovery session question.',
-          'Each choice must have a short "label" (max 60 chars) and a "text" field with a 2–3 sentence',
-          'grounded draft answer the founder can select and refine.',
-          'Base drafts on the session context — distinct plausible directions grounded in what the founder shared.',
+          'Each choice must have a short "label" (max 60 chars) and a "text" field with a 2–3 sentence grounded draft.',
+          'Each draft MUST include: (1) a specific persona (role + segment), (2) a concrete trigger or example,',
+          '(3) a quantified or bounded claim (frequency, cost, size, timeline).',
+          'Use labels that signal depth when useful: "With numbers", "With customer quote", "Hypothesis — needs validation".',
+          'Base drafts on the session context and focus area — distinct plausible directions grounded in what the founder shared.',
         ].join(' '),
       },
       {
