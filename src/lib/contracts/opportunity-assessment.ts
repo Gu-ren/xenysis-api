@@ -125,6 +125,19 @@ export const ScoreBreakdownSchema = z.object({
 })
 export type ScoreBreakdown = z.infer<typeof ScoreBreakdownSchema>
 
+/** Deterministic opportunityScore from scoreBreakdown dimension scores and weights. */
+export function computeOpportunityScoreFromBreakdown(breakdown: ScoreBreakdown): number {
+  const dimensions = [
+    breakdown.problemStrength,
+    breakdown.customerClarity,
+    breakdown.marketPotential,
+    breakdown.competitiveAdvantage,
+    breakdown.founderFit,
+  ]
+  const weightedSum = dimensions.reduce((sum, d) => sum + d.score * (d.weight / 100), 0)
+  return Math.round(weightedSum)
+}
+
 // ── v2.0: Confidence Breakdown ────────────────────────────────────────────────
 // Per-category evidence quality that drives the confidence score.
 // Pre-computed deterministically; LLM receives computedScore as anchor.

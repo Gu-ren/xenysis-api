@@ -15,6 +15,7 @@ import {
   buildUnderstanding,
   EMPTY_UNDERSTANDING,
   FounderUnderstandingSchema,
+  computeEarlyExitEligible,
 } from '../lib/contracts/founder-understanding.ts'
 
 // Per-turn novelty classification for each category.
@@ -185,7 +186,7 @@ export async function updateUnderstanding(
   // These defaults are tunable via environment variables without redeployment.
   const MIN_EXCHANGES: Record<FounderStage, number> = {
     idea:     Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_IDEA     ?? 6),
-    building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 8),
+    building: Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_BUILDING ?? 6),
     revenue:  Number(process.env.MIN_EXCHANGES_BEFORE_COMPLETION_REVENUE  ?? 6),
   }
   if (understanding.isComplete && messagesCount < MIN_EXCHANGES[founderStage]) {
@@ -202,17 +203,14 @@ export async function updateUnderstanding(
     }
   }
 
-  // Beta early-exit eligibility — secondary path that surfaces a founder-facing choice when
-  // Xenysis has foundational understanding but the session has not yet naturally completed.
-  // Criteria: required categories at partial confidence + overall floor + exchange minimum.
-  const earlyExitEligible = (
-    !understanding.isComplete &&
-    understanding.categories.problem.confidence  >= 50 &&
-    understanding.categories.customer.confidence >= 50 &&
-    understanding.categories.solution.confidence >= 50 &&
-    understanding.overallConfidence >= 70 &&
+  // Beta early-exit eligibility — tiered thresholds (80% first, 90% after dismiss).
+  understanding = {
+    ...understanding,
+    earlyExitDismissed: existingUnderstanding.earlyExitDismissed ?? false,
+  }
+  const earlyExitEligible =
+    computeEarlyExitEligible(understanding) &&
     messagesCount >= MIN_EXCHANGES[founderStage]
-  )
   understanding = { ...understanding, earlyExitEligible }
 
   // Determine evidence items that are new this turn.

@@ -1,0 +1,70 @@
+# Local development stack for xenysis-api.
+#
+# Quick start:
+#   cp .env.example .env   # fill in secrets (JWT_SECRET, API keys, etc.)
+#   docker compose up --build
+#
+# Hot-reload dev server (Postgres still in Docker):
+#   docker compose --profile dev up db api-dev
+#
+# Database only (run API on host with npm run dev):
+#   docker compose up db -d
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: xenysis
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d xenysis"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3001}:3001"
+    env_file:
+      - .env
+    environment:
+      # Override host-local values for in-compose networking
+      DATABASE_URL: postgresql://postgres:password@db:5432/xenysis
+      NODE_ENV: development
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api-dev:
+    profiles: [dev]
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+      - api_dev_node_modules:/app/node_modules
+    command: sh -c "npm ci && npm run dev"
+    ports:
+      - "${PORT:-3001}:3001"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:password@db:5432/xenysis
+      NODE_ENV: development
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  api_dev_node_modules:

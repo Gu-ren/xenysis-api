@@ -64,6 +64,20 @@
       "when": 1750377600000,
       "tag": "0008_workspace_waitlist",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1750464000000,
+      "tag": "0009_fast_master_chief",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1750550400000,
+      "tag": "0010_custom_auth",
+      "breakpoints": true
     }
   ]
 }

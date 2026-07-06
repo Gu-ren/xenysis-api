@@ -17,6 +17,8 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/drizzle ./drizzle
+COPY --from=builder /app/scripts/migrate-and-start.mjs ./scripts/migrate-and-start.mjs
 
 EXPOSE 3001
-CMD ["node", "dist/index.js"]
+CMD ["node", "scripts/migrate-and-start.mjs"]
