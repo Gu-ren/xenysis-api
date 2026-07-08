@@ -202,6 +202,12 @@ blueprintRouter.get(
 const chatBodySchema = z.object({
   message:        z.string().min(1).max(2000),
   currentContent: BlueprintContentSchema,
+  history:        z.array(
+    z.object({
+      role:    z.enum(['user', 'assistant']),
+      content: z.string().max(2000),
+    }),
+  ).max(8).optional(),
 })
 
 blueprintRouter.post(
@@ -211,11 +217,11 @@ blueprintRouter.post(
   zValidator('json', chatBodySchema),
   async (c) => {
     const { id: startupId }               = c.req.valid('param')
-    const { message, currentContent }     = c.req.valid('json')
+    const { message, currentContent, history } = c.req.valid('json')
     const userId                          = c.var.user.id
 
     const service = new BlueprintChatService(db, openai)
-    const stream  = await service.chatStream(startupId, userId, message, currentContent)
+    const stream  = await service.chatStream(startupId, userId, message, currentContent, history ?? [])
 
     return c.body(stream, 200, SSE_HEADERS)
   },
