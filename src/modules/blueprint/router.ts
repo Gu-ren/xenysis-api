@@ -12,6 +12,7 @@ import { zValidator } from '../../middleware/validate.ts'
 import { NotFoundError } from '../../middleware/errors.ts'
 import { anthropic, openai } from '../../lib/ai/client.ts'
 import { BlueprintGenerationService } from '../../services/blueprint-generation-service.ts'
+import { BlueprintChatService } from '../../services/blueprint-chat-service.ts'
 import { BlueprintContentSchema } from '../../lib/contracts/blueprint.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
@@ -192,5 +193,30 @@ blueprintRouter.get(
         generatedAt:   row.generatedAt,
       },
     })
+  },
+)
+
+// ── POST /:id/blueprints/chat  ← SSE ─────────────────────────────────────────
+// Accepts a natural-language instruction + current blueprint content, applies
+// AI-driven edits, streams ChatEvents back as SSE, and persists a new version.
+const chatBodySchema = z.object({
+  message:        z.string().min(1).max(2000),
+  currentContent: BlueprintContentSchema,
+})
+
+blueprintRouter.post(
+  '/:id/blueprints/chat',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  zValidator('json', chatBodySchema),
+  async (c) => {
+    const { id: startupId }               = c.req.valid('param')
+    const { message, currentContent }     = c.req.valid('json')
+    const userId                          = c.var.user.id
+
+    const service = new BlueprintChatService(db, anthropic)
+    const stream  = await service.chatStream(startupId, userId, message, currentContent)
+
+    return c.body(stream, 200, SSE_HEADERS)
   },
 )

@@ -1,8 +1,8 @@
 import { Hono } from 'hono'
-import { and, desc, eq, isNull } from 'drizzle-orm'
+import { and, count, desc, eq, isNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { db } from '../../lib/db/index.ts'
-import { startups } from '../../lib/db/schema/index.ts'
+import { blueprints, opportunityAssessments, startups } from '../../lib/db/schema/index.ts'
 import { requireStartupOwner } from '../../lib/db/startup-queries.ts'
 import { requireAuth } from '../../middleware/auth.ts'
 import { zValidator } from '../../middleware/validate.ts'
@@ -144,5 +144,68 @@ startupsRouter.delete(
       .where(and(eq(startups.id, id), eq(startups.userId, userId)))
 
     return c.body(null, 204)
+  },
+)
+
+// GET /api/v1/startups/:id/health
+startupsRouter.get(
+  '/:id/health',
+  requireAuth,
+  zValidator('param', idParam),
+  async (c) => {
+    const { id } = c.req.valid('param')
+    const userId = c.var.user.id
+
+    const startup = await requireStartupOwner(id, userId)
+
+    const stageScores: Record<string, number> = {
+      'founder-session': 20,
+      generating:        40,
+      preview:           55,
+      build:             75,
+      deployed:          100,
+    }
+
+    const stageProgress: Record<string, number> = {
+      'founder-session': 0,
+      generating:        50,
+      preview:           75,
+      build:             90,
+      deployed:          100,
+    }
+
+    const stageDeploymentStatus: Record<string, string> = {
+      'founder-session': 'not-started',
+      generating:        'not-started',
+      preview:           'not-started',
+      build:             'in-progress',
+      deployed:          'deployed',
+    }
+
+    const stage = startup.lifecycleStage
+
+    const [[{ blueprintCount }], [{ assessmentCount }]] = await Promise.all([
+      db
+        .select({ blueprintCount: count() })
+        .from(blueprints)
+        .where(eq(blueprints.startupId, id)),
+      db
+        .select({ assessmentCount: count() })
+        .from(opportunityAssessments)
+        .where(eq(opportunityAssessments.startupId, id)),
+    ])
+
+    const assetCount = (blueprintCount ?? 0) + (assessmentCount ?? 0)
+
+    return c.json({
+      data: {
+        startupId:          id,
+        score:              stageScores[stage] ?? 0,
+        generationProgress: stageProgress[stage] ?? 0,
+        deploymentReady:    stage === 'deployed',
+        assetCount,
+        deploymentStatus:   stageDeploymentStatus[stage] ?? 'not-started',
+      },
+    })
   },
 )
