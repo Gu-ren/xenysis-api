@@ -13,6 +13,32 @@ import {
   formatChatSSE,
 } from '../agents/base/events.ts'
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+type PlainObject = Record<string, unknown>
+
+function isPlainObject(v: unknown): v is PlainObject {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/**
+ * Recursively merges `patch` into `base`.
+ * - Plain objects are merged key-by-key (deep).
+ * - Arrays REPLACE — section arrays (risks, scope, milestones…) are ordered
+ *   structured data; appending blindly would create duplicates.
+ * - All other values (strings, numbers, booleans, null) are taken from `patch`.
+ */
+function deepMerge(base: unknown, patch: unknown): unknown {
+  if (!isPlainObject(base) || !isPlainObject(patch)) return patch
+  const result: PlainObject = { ...base }
+  for (const key of Object.keys(patch)) {
+    result[key] = isPlainObject(base[key]) && isPlainObject(patch[key])
+      ? deepMerge(base[key], patch[key])
+      : patch[key]
+  }
+  return result
+}
+
 // ── BlueprintChatService ──────────────────────────────────────────────────────
 // Handles AI-powered blueprint editing via natural language chat.
 //
@@ -49,11 +75,18 @@ export class BlueprintChatService {
 
 Your task:
 1. Understand what the user wants to change.
-2. Return ONLY the modified sections as a valid JSON object — a partial blueprint containing only the top-level keys that changed (e.g. { "overview": { ... } }).
-3. Do NOT include sections that were not changed.
-4. Preserve all existing data in unchanged fields within a changed section.
-5. Ensure all string values respect their field's purpose (tagline ≤ 160 chars, positionStatement ≤ 500 chars, etc.).
-6. Return ONLY valid JSON. No explanation, no markdown, no code fences.
+2. Return ONLY the top-level section keys that changed (e.g. { "overview": { ... } }). Do NOT include unchanged sections.
+3. CRITICAL: For every section you include, return the COMPLETE section object with ALL its fields — even fields you are not changing. Never return a partial section with only the changed field.
+4. Preserve enum values exactly as they appear in the current content. Valid examples:
+   - priority: "must_have" | "should_have" | "nice_to_have" | "wont_have"
+   - severity: "low" | "medium" | "high" | "critical"
+   - gtmMotion: "product_led" | "sales_led" | "community_led" | "partnership_led" | "marketing_led"
+   - techSavviness: "low" | "medium" | "high"
+   - buyerVsUser: "same" | "different" | "both"
+   - problemSeverity / rating: "low" | "medium" | "high" | "very_high"
+   - emotion: "frustrated" | "confused" | "neutral" | "interested" | "satisfied" | "delighted"
+5. Respect field length limits (tagline ≤ 160 chars, positionStatement ≤ 500 chars, etc.).
+6. Return ONLY the raw JSON object. No explanation, no markdown, no code fences.
 
 Current blueprint content:
 ${JSON.stringify(currentContent)}`
@@ -84,18 +117,21 @@ ${JSON.stringify(currentContent)}`
             return
           }
 
-          // Deep merge the patch into the current content
-          const merged: BlueprintContent = {
-            ...currentContent,
+          // Deep-merge the patch into the current content section-by-section.
+          // Shallow spread (`...patch`) would replace an entire section object
+          // with whatever the model returned — losing required fields the model
+          // omitted. Deep merge fills those gaps from currentContent.
+          const mergedUnknown = deepMerge(currentContent, {
             ...patch,
-            // Preserve _schemaVersion
             _schemaVersion: currentContent._schemaVersion,
-          }
+          })
+          const merged = mergedUnknown as BlueprintContent
 
           // Validate against the full schema
           const validated = BlueprintContentSchema.safeParse(merged)
           if (!validated.success) {
-            emit(formatChatSSE(chatErrorEvent('The resulting blueprint failed validation. Your change may conflict with required fields.')))
+            console.error('[BlueprintChatService] validation failed', JSON.stringify(validated.error.format(), null, 2))
+            emit(formatChatSSE(chatErrorEvent('The resulting blueprint failed validation. Please try rephrasing your request.')))
             controller.close()
             return
           }
