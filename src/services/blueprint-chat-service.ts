@@ -1,5 +1,5 @@
 import { eq, max } from 'drizzle-orm'
-import type Anthropic from '@anthropic-ai/sdk'
+import type OpenAI from 'openai'
 import type { DB } from '../lib/db/index.ts'
 import { blueprints, blueprintVersions } from '../lib/db/schema/artifacts.ts'
 import { BlueprintContentSchema } from '../lib/contracts/blueprint.ts'
@@ -23,8 +23,8 @@ import {
 //   { type: 'chat_error',    data: { message } }    — error
 export class BlueprintChatService {
   constructor(
-    private readonly db:        DB,
-    private readonly anthropic: Anthropic,
+    private readonly db:     DB,
+    private readonly openai: OpenAI,
   ) {}
 
   async chatStream(
@@ -35,7 +35,7 @@ export class BlueprintChatService {
   ): Promise<ReadableStream> {
     await requireStartupOwner(startupId, userId)
 
-    const { db, anthropic } = this
+    const { db, openai } = this
 
     return new ReadableStream({
       async start(controller) {
@@ -45,7 +45,6 @@ export class BlueprintChatService {
         try {
           emit(formatChatSSE(chatThinkingEvent('Analysing your request…')))
 
-          // Build system prompt with the blueprint schema context
           const systemPrompt = `You are an expert startup blueprint editor. The user will give you an instruction to modify their startup blueprint.
 
 Your task:
@@ -54,37 +53,31 @@ Your task:
 3. Do NOT include sections that were not changed.
 4. Preserve all existing data in unchanged fields within a changed section.
 5. Ensure all string values respect their field's purpose (tagline ≤ 160 chars, positionStatement ≤ 500 chars, etc.).
-6. Return ONLY the raw JSON object. No explanation, no markdown, no code fences.
+6. Return ONLY valid JSON. No explanation, no markdown, no code fences.
 
 Current blueprint content:
-${JSON.stringify(currentContent, null, 2)}`
-
-          // Stream the Anthropic response
-          let accumulated = ''
-          const stream = anthropic.messages.stream({
-            model:      'claude-opus-4-5',
-            max_tokens: 4096,
-            system:     systemPrompt,
-            messages:   [{ role: 'user', content: message }],
-          })
+${JSON.stringify(currentContent)}`
 
           emit(formatChatSSE(chatThinkingEvent('Generating changes…')))
 
-          for await (const chunk of stream) {
-            if (
-              chunk.type === 'content_block_delta' &&
-              chunk.delta.type === 'text_delta'
-            ) {
-              accumulated += chunk.delta.text
-            }
-          }
+          // Use OpenAI with json_object mode for reliable structured output.
+          // Consistent with the rest of the generation pipeline (gpt-4o / OpenAI).
+          const response = await openai.chat.completions.create({
+            model:           'gpt-4o',
+            response_format: { type: 'json_object' },
+            max_tokens:      4096,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user',   content: message },
+            ],
+          })
 
-          // Parse the JSON patch returned by the AI
+          const accumulated = response.choices[0]?.message?.content ?? ''
+
+          // Parse the JSON patch returned by the model
           let patch: Partial<BlueprintContent>
           try {
-            // Strip any accidental markdown code fences
-            const clean = accumulated.replace(/^```(?:json)?\n?/m, '').replace(/```$/m, '').trim()
-            patch = JSON.parse(clean) as Partial<BlueprintContent>
+            patch = JSON.parse(accumulated) as Partial<BlueprintContent>
           } catch {
             emit(formatChatSSE(chatErrorEvent('AI returned malformed JSON. Please try again.')))
             controller.close()
