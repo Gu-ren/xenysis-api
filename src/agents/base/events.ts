@@ -38,6 +38,7 @@ export type ChatEvent =
   | { type: 'chat_patch';    data: { path: string; value: unknown } }
   | { type: 'chat_complete'; data: { content: unknown } }
   | { type: 'chat_error';    data: { message: string } }
+  | { type: 'chat_clarify';  data: { question: string; choices: string[] } }
 
 export function chatThinkingEvent(message: string): ChatEvent {
   return { type: 'chat_thinking', data: { message } }
@@ -53,6 +54,10 @@ export function chatCompleteEvent(content: unknown): ChatEvent {
 
 export function chatErrorEvent(message: string): ChatEvent {
   return { type: 'chat_error', data: { message } }
+}
+
+export function chatClarifyEvent(question: string, choices: string[]): ChatEvent {
+  return { type: 'chat_clarify', data: { question, choices } }
 }
 
 export function formatChatSSE(event: ChatEvent): string {

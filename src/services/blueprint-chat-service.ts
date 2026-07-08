@@ -10,6 +10,7 @@ import {
   chatPatchEvent,
   chatCompleteEvent,
   chatErrorEvent,
+  chatClarifyEvent,
   formatChatSSE,
 } from '../agents/base/events.ts'
 
@@ -43,10 +44,18 @@ function deepMerge(base: unknown, patch: unknown): unknown {
 // Handles AI-powered blueprint editing via natural language chat.
 //
 // SSE stream contract:
-//   { type: 'chat_thinking', data: { message } }   — AI is working
-//   { type: 'chat_patch',    data: { path, value } } — field updated (top-level section key)
-//   { type: 'chat_complete', data: { content } }    — final blueprint content
-//   { type: 'chat_error',    data: { message } }    — error
+//   { type: 'chat_thinking', data: { message } }           — AI is working
+//   { type: 'chat_patch',    data: { path, value } }       — field updated
+//   { type: 'chat_complete', data: { content } }           — final blueprint
+//   { type: 'chat_error',    data: { message } }           — error
+//   { type: 'chat_clarify',  data: { question, choices } } — needs more context
+
+type ModelResponse = {
+  action?:   string
+  patch?:    Partial<BlueprintContent>
+  question?: string
+  choices?:  string[]
+}
 export class BlueprintChatService {
   constructor(
     private readonly db:     DB,
@@ -58,6 +67,7 @@ export class BlueprintChatService {
     userId:         string,
     message:        string,
     currentContent: BlueprintContent,
+    history:        Array<{ role: 'user' | 'assistant'; content: string }> = [],
   ): Promise<ReadableStream> {
     await requireStartupOwner(startupId, userId)
 
@@ -73,20 +83,32 @@ export class BlueprintChatService {
 
           const systemPrompt = `You are an expert startup blueprint editor. The user will give you an instruction to modify their startup blueprint.
 
-Your task:
-1. Understand what the user wants to change.
-2. Return ONLY the top-level section keys that changed (e.g. { "overview": { ... } }). Do NOT include unchanged sections.
-3. CRITICAL: For every section you include, return the COMPLETE section object with ALL its fields — even fields you are not changing. Never return a partial section with only the changed field.
-4. Preserve enum values exactly as they appear in the current content. Valid examples:
+Always return a JSON object with exactly one of these two shapes:
+
+Shape A — when you have enough context to make the change:
+{ "action": "edit", "patch": { ...only the top-level section keys that changed... } }
+
+Shape B — when the request is vague, has multiple valid interpretations, or the direction strongly affects the outcome:
+{ "action": "clarify", "question": "A concise question (1 sentence)", "choices": ["Option 1", "Option 2", "Option 3"] }
+
+Rules for "edit":
+1. Include ONLY top-level section keys that changed. Do NOT include unchanged sections.
+2. CRITICAL: For every section in patch, return the COMPLETE section object with ALL its fields — even unchanged ones. Never return a partial section.
+3. Preserve enum values exactly as they appear. Valid values:
    - priority: "must_have" | "should_have" | "nice_to_have" | "wont_have"
    - severity: "low" | "medium" | "high" | "critical"
    - gtmMotion: "product_led" | "sales_led" | "community_led" | "partnership_led" | "marketing_led"
-   - techSavviness: "low" | "medium" | "high"
+   - techSavviness / rating / problemSeverity: "low" | "medium" | "high" | "very_high"
    - buyerVsUser: "same" | "different" | "both"
-   - problemSeverity / rating: "low" | "medium" | "high" | "very_high"
    - emotion: "frustrated" | "confused" | "neutral" | "interested" | "satisfied" | "delighted"
-5. Respect field length limits (tagline ≤ 160 chars, positionStatement ≤ 500 chars, etc.).
-6. Return ONLY the raw JSON object. No explanation, no markdown, no code fences.
+4. Respect field length limits (tagline ≤ 160 chars, positionStatement ≤ 500 chars, etc.).
+
+Rules for "clarify":
+- Trigger when: too vague ("make it better"), direction strongly affects outcome, 2+ equally valid interpretations.
+- Do NOT clarify if the conversation history already answers the question.
+- Provide 3–5 short, distinct, mutually exclusive choices (≤ 8 words each).
+
+Return ONLY the raw JSON object. No explanation, no markdown, no code fences.
 
 Current blueprint content:
 ${JSON.stringify(currentContent)}`
@@ -101,21 +123,40 @@ ${JSON.stringify(currentContent)}`
             max_tokens:      4096,
             messages: [
               { role: 'system', content: systemPrompt },
+              ...history.map(h => ({ role: h.role as 'user' | 'assistant', content: h.content })),
               { role: 'user',   content: message },
             ],
           })
 
           const accumulated = response.choices[0]?.message?.content ?? ''
 
-          // Parse the JSON patch returned by the model
-          let patch: Partial<BlueprintContent>
+          // Parse the discriminated union returned by the model:
+          //   { action: "edit",    patch: {...} }
+          //   { action: "clarify", question: "...", choices: [...] }
+          let result: ModelResponse
           try {
-            patch = JSON.parse(accumulated) as Partial<BlueprintContent>
+            result = JSON.parse(accumulated) as ModelResponse
           } catch {
             emit(formatChatSSE(chatErrorEvent('AI returned malformed JSON. Please try again.')))
             controller.close()
             return
           }
+
+          // Handle clarify — send question + choices, do not modify the blueprint
+          if (result.action === 'clarify') {
+            const question = typeof result.question === 'string'
+              ? result.question
+              : 'Could you clarify your request?'
+            const choices = Array.isArray(result.choices)
+              ? (result.choices as unknown[]).filter((c): c is string => typeof c === 'string')
+              : []
+            emit(formatChatSSE(chatClarifyEvent(question, choices)))
+            controller.close()
+            return
+          }
+
+          // Handle edit — extract patch (support both { action:"edit", patch:{} } and direct-patch fallback)
+          const patch = (result.patch ?? result) as Partial<BlueprintContent>
 
           // Deep-merge the patch into the current content section-by-section.
           // Shallow spread (`...patch`) would replace an entire section object
