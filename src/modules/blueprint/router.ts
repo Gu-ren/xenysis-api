@@ -214,7 +214,7 @@ blueprintRouter.post(
     const { message, currentContent }     = c.req.valid('json')
     const userId                          = c.var.user.id
 
-    const service = new BlueprintChatService(db, anthropic)
+    const service = new BlueprintChatService(db, openai)
     const stream  = await service.chatStream(startupId, userId, message, currentContent)
 
     return c.body(stream, 200, SSE_HEADERS)
