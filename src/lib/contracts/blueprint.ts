@@ -341,6 +341,33 @@ export type BlueprintMetrics = z.infer<typeof BlueprintMetricsSchema>
 //     businessModel  → GTMCard and RevenueCard nodes
 //     metrics        → MetricCard nodes (northStar as primary OKR)
 
+// Freeform custom notes the founder adds on the blueprint page.
+export const CustomSectionSchema = z.object({
+  id:    z.string().uuid(),
+  title: z.string().min(1).max(120),
+  body:  z.string().max(8000),
+})
+export type CustomSection = z.infer<typeof CustomSectionSchema>
+
+// Safe subset for structured custom blocks (Phase 8 schema builder).
+export const CustomBlockFieldTypeSchema = z.enum([
+  'string', 'number', 'boolean', 'enum', 'string_array',
+])
+export const CustomBlockFieldSchema = z.object({
+  key:      z.string().min(1).max(64),
+  label:    z.string().min(1).max(120),
+  type:     CustomBlockFieldTypeSchema,
+  required: z.boolean().default(false),
+  options:  z.array(z.string().max(80)).max(30).optional(), // for enum
+})
+export const CustomBlockSchema = z.object({
+  id:     z.string().uuid(),
+  name:   z.string().min(1).max(120),
+  fields: z.array(CustomBlockFieldSchema).max(40),
+  data:   z.record(z.string(), z.unknown()).default({}),
+})
+export type CustomBlock = z.infer<typeof CustomBlockSchema>
+
 export const BlueprintContentSchema = z.object({
   _schemaVersion: z.literal('1.0'),
 
@@ -356,5 +383,13 @@ export const BlueprintContentSchema = z.object({
   roadmap:       BlueprintRoadmapSchema,
   risks:         BlueprintRisksSchema,
   metrics:       BlueprintMetricsSchema,
+  // Additive — old JSONB rows parse with empty defaults.
+  customSections: z.array(CustomSectionSchema).max(20).default([]),
+  customBlocks:   z.array(CustomBlockSchema).max(20).default([]),
 })
 export type BlueprintContent = z.infer<typeof BlueprintContentSchema>
+
+export const BlueprintSaveSourceSchema = z.enum([
+  'manual', 'ai_apply', 'restore', 'generate', 'chat',
+])
+export type BlueprintSaveSource = z.infer<typeof BlueprintSaveSourceSchema>

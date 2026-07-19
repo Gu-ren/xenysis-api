@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
-import { and, eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { z } from 'zod'
+import { BlueprintContentSchema } from '../../lib/contracts/blueprint.ts'
 import { db } from '../../lib/db/index.ts'
 import {
   founderSessions,
@@ -333,5 +334,48 @@ opportunityRouter.get(
         generatedAt:   row.generatedAt,
       },
     })
+  },
+)
+
+// ── POST /:id/opportunity/regenerate-from-blueprint  ← SSE ───────────────────
+// Re-runs OA using the latest completed founder session, guided by blueprint edits.
+// Blueprint content is accepted for client confirmation / future prompt enrichment;
+// the agent still builds from session memory + understanding.
+const regenerateFromBlueprintBody = z.object({
+  blueprintContent: BlueprintContentSchema.optional(),
+  sessionId:        z.string().uuid().optional(),
+})
+
+opportunityRouter.post(
+  '/:id/opportunity/regenerate-from-blueprint',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  zValidator('json', regenerateFromBlueprintBody),
+  async (c) => {
+    const { id: startupId } = c.req.valid('param')
+    const userId = c.var.user.id
+    const { sessionId: bodySessionId } = c.req.valid('json')
+
+    await requireStartupOwner(startupId, userId)
+
+    let sessionId = bodySessionId
+    if (!sessionId) {
+      const latest = await db.query.founderSessions.findFirst({
+        where: and(
+          eq(founderSessions.startupId, startupId),
+          eq(founderSessions.userId, userId),
+          eq(founderSessions.status, 'completed'),
+        ),
+        orderBy: [desc(founderSessions.updatedAt)],
+        columns: { id: true },
+      })
+      if (!latest) {
+        throw new BusinessRuleError('No completed founder session found to re-run assessment')
+      }
+      sessionId = latest.id
+    }
+
+    const stream = await runAssessmentStream(startupId, sessionId, userId)
+    return c.body(stream, 200, SSE_HEADERS)
   },
 )

@@ -36,6 +36,7 @@ export function formatSSE(event: GenerationEvent): string {
 export type ChatEvent =
   | { type: 'chat_thinking'; data: { message: string } }
   | { type: 'chat_patch';    data: { path: string; value: unknown } }
+  | { type: 'chat_suggestion'; data: { summary: string; rationale: string; patch: unknown; previewContent: unknown } }
   | { type: 'chat_complete'; data: { content: unknown } }
   | { type: 'chat_error';    data: { message: string } }
   | { type: 'chat_clarify';  data: { question: string; choices: string[] } }
@@ -46,6 +47,15 @@ export function chatThinkingEvent(message: string): ChatEvent {
 
 export function chatPatchEvent(path: string, value: unknown): ChatEvent {
   return { type: 'chat_patch', data: { path, value } }
+}
+
+export function chatSuggestionEvent(
+  summary: string,
+  rationale: string,
+  patch: unknown,
+  previewContent: unknown,
+): ChatEvent {
+  return { type: 'chat_suggestion', data: { summary, rationale, patch, previewContent } }
 }
 
 export function chatCompleteEvent(content: unknown): ChatEvent {
