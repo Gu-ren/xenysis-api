@@ -3,6 +3,7 @@ import { CATEGORY_DISPLAY } from '../../lib/contracts/founder-understanding.ts'
 import type { UnderstandingCategory } from '../../lib/contracts/founder-understanding.ts'
 import type { SessionSummary } from '../../lib/contracts/session-summary.ts'
 import type { FounderMemory } from '../../lib/contracts/founder-memory.ts'
+import type { PlannedTopic } from '../../lib/contracts/interview-coverage.ts'
 import {
   ANSWER_CHOICES_SCHEMA,
   normalizeAnswerChoices,
@@ -17,6 +18,10 @@ export interface GenerateAnswerChoicesParams {
   sessionSummary: SessionSummary | null
   founderMemory: FounderMemory | null
   recentExchanges: Array<{ question: string; answer: string }>
+  /** Planned topic for this turn — choices must stay on this slot. */
+  plannedTopic?: PlannedTopic | null
+  /** Founder's latest message that triggered this turn. */
+  latestFounderMessage?: string | null
 }
 
 export interface GenerateAnswerChoicesResult {
@@ -26,7 +31,8 @@ export interface GenerateAnswerChoicesResult {
   outputTokens: number
 }
 
-function buildContextBlocks(params: GenerateAnswerChoicesParams): string[] {
+/** Pure context builder — exported for unit tests. */
+export function buildContextBlocks(params: GenerateAnswerChoicesParams): string[] {
   const lines: string[] = [
     `Startup: ${params.startupName}`,
   ]
@@ -35,10 +41,29 @@ function buildContextBlocks(params: GenerateAnswerChoicesParams): string[] {
     lines.push(`Description: ${params.startupDescription}`)
   }
 
-  const focusHint = params.weakestCategory
-    ? CATEGORY_DISPLAY[params.weakestCategory].label
-    : 'the current discovery topic'
-  lines.push(`Focus area: ${focusHint}`)
+  if (params.plannedTopic) {
+    lines.push(
+      '',
+      'Planned topic (choices MUST answer this slot only):',
+      `Category: ${CATEGORY_DISPLAY[params.plannedTopic.category].label}`,
+      `Topic slot: ${params.plannedTopic.topicSlot}`,
+      `Must elicit: ${params.plannedTopic.mustElicit}`,
+      `Depth: ${params.plannedTopic.depth}`,
+    )
+  } else {
+    const focusHint = params.weakestCategory
+      ? CATEGORY_DISPLAY[params.weakestCategory].label
+      : 'the current discovery topic'
+    lines.push(`Focus area: ${focusHint}`)
+  }
+
+  if (params.latestFounderMessage) {
+    lines.push(
+      '',
+      'Founder\'s latest answer (reuse their names, numbers, and phrases):',
+      params.latestFounderMessage,
+    )
+  }
 
   if (params.sessionSummary) {
     lines.push(
@@ -57,7 +82,7 @@ function buildContextBlocks(params: GenerateAnswerChoicesParams): string[] {
       params.founderMemory.one_sentence_pitch ? `Pitch: ${params.founderMemory.one_sentence_pitch}` : '',
       params.founderMemory.problem            ? `Problem: ${params.founderMemory.problem}` : '',
       params.founderMemory.customer           ? `Customer: ${params.founderMemory.customer}` : '',
-      params.founderMemory.business_model    ? `Business model: ${params.founderMemory.business_model}` : '',
+      params.founderMemory.business_model     ? `Business model: ${params.founderMemory.business_model}` : '',
     )
   }
 
@@ -75,6 +100,19 @@ function buildContextBlocks(params: GenerateAnswerChoicesParams): string[] {
   return lines.filter((l) => l !== undefined && l !== '')
 }
 
+const CHOICES_SYSTEM_PROMPT = [
+  'Generate exactly 3 suggested answer choices for a founder/CEO discovery question.',
+  'Each choice must have a short "label" (max 60 chars) and a "text" field with a 2–3 sentence grounded draft.',
+  'HARD RULES:',
+  '- All 3 drafts MUST answer THIS question and stay on the planned topic slot when provided — not three unrelated categories.',
+  '- Reuse names, numbers, phrases, and contexts from the founder\'s latest answer and memory whenever present.',
+  '- Distinct directions that still stay on-topic (e.g. different customer examples of the same pain).',
+  '- CEO / product language only: pain, customers, features, outcomes, pricing, competitors.',
+  '- NEVER mention tech stack, frameworks, databases, APIs, scalability, architecture, or deployment.',
+  '- Prefer drafts with: (1) a specific persona or concrete example, (2) a trigger or situation, (3) a quantified or bounded claim when it fits.',
+  'Use labels that signal depth when useful: "With numbers", "With customer quote", "Hypothesis — needs validation".',
+].join(' ')
+
 export async function generateAnswerChoices(
   params: GenerateAnswerChoicesParams,
 ): Promise<GenerateAnswerChoicesResult> {
@@ -84,14 +122,7 @@ export async function generateAnswerChoices(
     messages: [
       {
         role:    'system',
-        content: [
-          'Generate exactly 3 suggested answer choices for a founder discovery session question.',
-          'Each choice must have a short "label" (max 60 chars) and a "text" field with a 2–3 sentence grounded draft.',
-          'Each draft MUST include: (1) a specific persona (role + segment), (2) a concrete trigger or example,',
-          '(3) a quantified or bounded claim (frequency, cost, size, timeline).',
-          'Use labels that signal depth when useful: "With numbers", "With customer quote", "Hypothesis — needs validation".',
-          'Base drafts on the session context and focus area — distinct plausible directions grounded in what the founder shared.',
-        ].join(' '),
+        content: CHOICES_SYSTEM_PROMPT,
       },
       {
         role:    'user',
@@ -126,8 +157,10 @@ export async function generateAnswerChoicesFallback(
 ): Promise<GenerateAnswerChoicesResult> {
   return generateAnswerChoices({
     ...params,
-    sessionSummary:  null,
-    founderMemory:   null,
-    recentExchanges: [],
+    sessionSummary:        null,
+    founderMemory:         null,
+    recentExchanges:       [],
+    plannedTopic:          null,
+    latestFounderMessage:  null,
   })
 }

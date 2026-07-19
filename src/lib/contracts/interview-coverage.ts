@@ -45,18 +45,18 @@ export const SLOT_MUST_ELICIT: Record<UnderstandingCategory, Record<string, stri
     beachhead:        'which segment or side they acquire first',
   },
   solution: {
-    mechanism:        'how the product works at a concrete level',
-    differentiation:  'why it beats the current alternative',
-    why_better:       'the core reason customers would switch',
+    mechanism:        'what the product lets the user do — must-have features and outcomes (not how it is built)',
+    differentiation:  'why those features beat the current workaround',
+    why_better:       'the reason a customer would choose this',
   },
   market: {
-    size:   'market size estimate (TAM/SAM/SOM style)',
-    growth: 'growth signal or trend',
+    size:   'who else has this problem and how widespread it is (plain language, no TAM jargon)',
+    growth: 'growth or demand signal in plain language',
     timing: 'why now',
   },
   pricing: {
-    revenue_model:      'subscription, usage, marketplace, or other model',
-    price_point:        'hypothesized price point',
+    revenue_model:      'how they plan to charge (subscription, usage, marketplace, or other)',
+    price_point:        'a rough price point',
     willingness_to_pay: 'any signal of willingness to pay',
   },
   competition: {
@@ -64,8 +64,8 @@ export const SLOT_MUST_ELICIT: Record<UnderstandingCategory, Record<string, stri
     switch_reason:      'why customers would switch away from them',
   },
   risks: {
-    biggest_threat: 'the biggest threat to viability',
-    key_assumption: 'the key unproven assumption',
+    biggest_threat: 'the biggest business or customer risk to viability (not technical/engineering risk)',
+    key_assumption: 'the key unproven customer or market assumption',
   },
   founder_fit: {
     domain_expertise: 'domain expertise',
