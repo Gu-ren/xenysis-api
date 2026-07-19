@@ -39,7 +39,11 @@ import {
 import { logActivity, trackUsage, estimateTokens, fromOpenAI } from '../../agents/base/utils.ts'
 import { updateUnderstanding, loadUnderstanding } from '../../services/understanding-engine.ts'
 import { planNextQuestion } from '../../services/interview-planner.ts'
-import { TopicSlotUpdatesSchema } from '../../lib/contracts/interview-coverage.ts'
+import {
+  TopicSlotUpdatesSchema,
+  appendQuestionHistory,
+  type PlannedTopic,
+} from '../../lib/contracts/interview-coverage.ts'
 import { chatRateLimit } from '../../middleware/rate-limit.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
@@ -357,34 +361,11 @@ founderSessionsRouter.post(
     // even before a founder_understanding row exists.
     const sessionMarketplaceDetected = session.marketplaceDetected || currentUnderstanding.marketplaceDetected
 
-    // Interview engine: application selects the next topic before the chat LLM runs.
-    const plannedTopic = planNextQuestion({
-      understanding:        currentUnderstanding,
-      coverage:             currentUnderstanding.interviewCoverage,
-      questionHistory:      currentUnderstanding.questionHistory ?? [],
-      marketplaceDetected:  sessionMarketplaceDetected,
-    })
-
-    console.log('[interview-planner] plannedTopic:', plannedTopic)
-
-    await logActivity(db, {
-      userId,
-      startupId,
-      type:        'interview.topic_planned',
-      description: plannedTopic
-        ? `Planned topic ${plannedTopic.category}/${plannedTopic.topicSlot} (${plannedTopic.depth})`
-        : 'Session complete — no topic planned',
-      meta:        { sessionId, plannedTopic },
-    })
-
-    const systemPrompt = buildChatSystemPrompt(
-      startup,
-      latestSummary,
-      currentUnderstanding,
-      sessionFounderStage,
-      sessionMarketplaceDetected,
-      plannedTopic,
-    )
+    const trimmedMessage = message.trim()
+    const isOpener = /^let'?s begin/i.test(trimmedMessage)
+    const isContinueCue = /^continue discovery\.?$/i.test(trimmedMessage)
+    // Real founder answers update understanding before the next question is planned.
+    const needsPreUpdate = !isOpener && !isContinueCue
 
     // Reconstruct conversation history from session answers.
     const historyMessages: Array<{ role: 'user' | 'assistant'; content: string }> =
@@ -423,12 +404,240 @@ founderSessionsRouter.post(
           let fallbackOutputTokens = 0
           let fallbackModel        = 'gpt-4o-mini'
           let usageModel     = 'gpt-4o'
+          let systemPrompt   = ''
+          let plannedTopic: PlannedTopic | null = null
+          let workingUnderstanding = currentUnderstanding
+          let streamedQuestion = false
 
           const emit = (payload: unknown) => {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
           }
 
+          const finalizeJob = async (newCount: number) => {
+            await Promise.all([
+              db
+                .update(generationJobs)
+                .set({ status: 'done', progress: 100, completedAt: new Date() })
+                .where(eq(generationJobs.id, job.id)),
+              db
+                .update(founderSessions)
+                .set({ messagesCount: newCount, updatedAt: new Date() })
+                .where(eq(founderSessions.id, sessionId)),
+            ])
+            await logActivity(db, {
+              userId,
+              startupId,
+              type:        'session.message_sent',
+              description: 'Founder session AI message exchanged',
+              meta:        { sessionId, jobId: job.id },
+            })
+          }
+
+          const patchPlannedQuestion = async (
+            understanding: typeof workingUnderstanding,
+            topic: PlannedTopic | null,
+            questionText: string,
+            turnCount: number,
+          ) => {
+            if (!topic || !questionText.trim()) return understanding
+            const next = {
+              ...understanding,
+              plannedTopic: topic,
+              questionHistory: appendQuestionHistory(understanding.questionHistory ?? [], {
+                text:      questionText.slice(0, 2000),
+                category:  topic.category,
+                topicSlot: topic.topicSlot,
+                turn:      turnCount,
+              }),
+            }
+            await db
+              .update(founderUnderstanding)
+              .set({ understanding: next, updatedAt: new Date() })
+              .where(eq(founderUnderstanding.sessionId, sessionId))
+            return next
+          }
+
           try {
+            const newCount = (session.messagesCount ?? 0) + 1
+
+            // ── 1. Update understanding from the founder's answer (before planning) ─
+            if (needsPreUpdate) {
+              emit({ type: 'status', data: { phase: 'understanding' } })
+
+              const memoryRes = await openai.chat.completions.create({
+                model:           'gpt-4o',
+                response_format: { type: 'json_schema', json_schema: FOUNDER_MEMORY_EXTRACTION_SCHEMA },
+                messages: [
+                  {
+                    role:    'system',
+                    content: buildMemoryExtractionSystemPrompt(startup.name, currentMemory),
+                  },
+                  ...historyMessages.slice(-10),
+                  { role: 'user', content: `<user_input>${message}</user_input>` },
+                ],
+              })
+
+              await trackUsage(db, {
+                userId,
+                startupId,
+                generationJobId: job.id,
+                usage:           fromOpenAI(memoryRes),
+                purpose:         'chat',
+              })
+
+              const memoryContent = memoryRes.choices[0]?.message?.content
+              if (memoryContent) {
+                let rawJson: unknown
+                try {
+                  rawJson = JSON.parse(memoryContent)
+                } catch (parseErr) {
+                  console.error('[founder memory] JSON parse failed', parseErr)
+                  rawJson = null
+                }
+
+                const slotUpdatesParsed = rawJson && typeof rawJson === 'object' && rawJson !== null && 'topic_slot_updates' in rawJson
+                  ? TopicSlotUpdatesSchema.safeParse((rawJson as { topic_slot_updates: unknown }).topic_slot_updates)
+                  : null
+                const topicSlotUpdates = slotUpdatesParsed?.success ? slotUpdatesParsed.data : []
+
+                const extracted = FounderMemorySchema.safeParse(rawJson)
+                if (!extracted.success) {
+                  console.error('[founder memory] schema validation failed', extracted.error.format())
+                } else {
+                  const existing = existingMemoryRow
+                    ? (FounderMemorySchema.safeParse(existingMemoryRow.memory).data ?? EMPTY_FOUNDER_MEMORY)
+                    : EMPTY_FOUNDER_MEMORY
+
+                  const merged = mergeFounderMemory(existing, extracted.data)
+
+                  if (existingMemoryRow) {
+                    await db
+                      .update(founderMemories)
+                      .set({ memory: merged, updatedAt: new Date() })
+                      .where(eq(founderMemories.sessionId, sessionId))
+                  } else {
+                    await db.insert(founderMemories).values({
+                      sessionId,
+                      startupId,
+                      userId,
+                      memory: merged,
+                    })
+                  }
+
+                  // Credit the topic the founder just answered (history already recorded after prior stream).
+                  const priorAskedTopic = currentUnderstanding.plannedTopic ?? null
+                  const understandingResult = await updateUnderstanding({
+                    db,
+                    sessionId,
+                    startupId,
+                    userId,
+                    memory:              merged,
+                    sourceMessageId:     job.id,
+                    founderStage:        sessionFounderStage,
+                    messagesCount:       newCount,
+                    marketplaceDetected: sessionMarketplaceDetected,
+                    topicSlotUpdates,
+                    askedTopic:          priorAskedTopic,
+                    assistantQuestionText: null,
+                  })
+                  workingUnderstanding = understandingResult.understanding
+
+                  if (understandingResult.isComplete) {
+                    const durationSeconds = Math.round(
+                      (Date.now() - session.createdAt.getTime()) / 1000,
+                    )
+                    await db
+                      .update(founderSessions)
+                      .set({
+                        status:                 'completed',
+                        sessionDurationSeconds: durationSeconds,
+                        updatedAt:              new Date(),
+                      })
+                      .where(eq(founderSessions.id, sessionId))
+
+                    await logActivity(db, {
+                      userId,
+                      startupId,
+                      type:        'session.completed',
+                      description: `Founder session completed for startup ${startupId}`,
+                      meta: {
+                        sessionId,
+                        founderStage:      session.founderStage ?? 'building',
+                        blueprintMode:     understandingResult.understanding.blueprintMode,
+                        overallConfidence: understandingResult.overallConfidence,
+                        messagesCount:     newCount,
+                        durationSeconds,
+                        gapsInBlueprint:   understandingResult.understanding.gapsInBlueprint,
+                      },
+                    })
+                  }
+                }
+              }
+            } else if (isContinueCue) {
+              // Fresh load after continue-discovery API already set earlyExitDismissed.
+              const row = await db.query.founderUnderstanding.findFirst({
+                where: eq(founderUnderstanding.sessionId, sessionId),
+              })
+              workingUnderstanding = row
+                ? (FounderUnderstandingSchema.safeParse(row.understanding).data ?? currentUnderstanding)
+                : currentUnderstanding
+            }
+
+            // ── 2. Early-exit gate: stop asking until Continue Discovery ─────────
+            const atDiscoveryGate =
+              workingUnderstanding.earlyExitEligible &&
+              !workingUnderstanding.earlyExitDismissed &&
+              !workingUnderstanding.isComplete
+
+            if (atDiscoveryGate && needsPreUpdate) {
+              await finalizeJob(newCount)
+              emit({
+                type: 'done',
+                data: {
+                  jobId: job.id,
+                  choices: [],
+                  earlyExitEligible: true,
+                  earlyExitDismissed: false,
+                },
+              })
+              controller.close()
+              return
+            }
+
+            // ── 3. Plan next topic from UPDATED understanding ───────────────────
+            emit({ type: 'status', data: { phase: 'planning' } })
+
+            plannedTopic = planNextQuestion({
+              understanding:       workingUnderstanding,
+              coverage:            workingUnderstanding.interviewCoverage,
+              questionHistory:     workingUnderstanding.questionHistory ?? [],
+              marketplaceDetected: sessionMarketplaceDetected || workingUnderstanding.marketplaceDetected,
+            })
+
+            console.log('[interview-planner] plannedTopic:', plannedTopic)
+
+            await logActivity(db, {
+              userId,
+              startupId,
+              type:        'interview.topic_planned',
+              description: plannedTopic
+                ? `Planned topic ${plannedTopic.category}/${plannedTopic.topicSlot} (${plannedTopic.depth})`
+                : 'Session complete — no topic planned',
+              meta: { sessionId, plannedTopic },
+            })
+
+            systemPrompt = buildChatSystemPrompt(
+              startup,
+              latestSummary,
+              workingUnderstanding,
+              sessionFounderStage,
+              sessionMarketplaceDetected || workingUnderstanding.marketplaceDetected,
+              plannedTopic,
+            )
+
+            // ── 4. Stream next question + choices ───────────────────────────────
+            emit({ type: 'status', data: { phase: 'thinking' } })
+
             const stream = await openai.chat.completions.create({
               model:          'gpt-4o',
               stream:         true,
@@ -458,27 +667,23 @@ founderSessionsRouter.post(
               }
             }
 
+            streamedQuestion = true
             const parsed = parseAnswerChoices(fullResponse)
             cleanResponse = parsed.text
             let choices = parsed.choices
 
-            const atDiscoveryGate =
-              currentUnderstanding.earlyExitEligible && !currentUnderstanding.earlyExitDismissed
-
-            if (atDiscoveryGate) {
-              choices = []
-            } else if (choices.length === 0 && requiresAnswerChoices(currentUnderstanding)) {
+            if (choices.length === 0 && requiresAnswerChoices(workingUnderstanding)) {
               const ctx = await loadChoicesContext(sessionId, startup)
               const generated = await generateAnswerChoices({
-                questionText:          cleanResponse,
-                startupName:           ctx.startupName,
-                startupDescription:    ctx.startupDescription,
-                weakestCategory:       ctx.currentUnderstanding.weakestCategory,
-                sessionSummary:        ctx.latestSummary,
-                founderMemory:         ctx.founderMemory,
-                recentExchanges:       ctx.recentExchanges,
+                questionText:         cleanResponse,
+                startupName:          ctx.startupName,
+                startupDescription:   ctx.startupDescription,
+                weakestCategory:      workingUnderstanding.weakestCategory ?? ctx.currentUnderstanding.weakestCategory,
+                sessionSummary:       ctx.latestSummary,
+                founderMemory:        ctx.founderMemory,
+                recentExchanges:      ctx.recentExchanges,
                 plannedTopic,
-                latestFounderMessage:  message,
+                latestFounderMessage: message,
               })
               choices = generated.choices
               fallbackInputTokens  = generated.inputTokens
@@ -486,33 +691,47 @@ founderSessionsRouter.post(
               fallbackModel        = generated.model
             }
 
-            // Sprint 2.5: the done event initially emits without understanding state,
-            // then the side-effect block updates understanding and nothing re-emits
-            // (the client polls GET /understanding for progress UI updates).
-            // This keeps the stream fast and the side-effects non-blocking.
-            emit({ type: 'done', data: { jobId: job.id, choices } })
+            workingUnderstanding = await patchPlannedQuestion(
+              workingUnderstanding,
+              plannedTopic,
+              cleanResponse,
+              newCount,
+            )
 
+            await finalizeJob(newCount)
+
+            emit({
+              type: 'done',
+              data: {
+                jobId: job.id,
+                choices,
+                earlyExitEligible: workingUnderstanding.earlyExitEligible,
+                earlyExitDismissed: workingUnderstanding.earlyExitDismissed,
+              },
+            })
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Stream error'
             emit({ type: 'error', data: { message: msg } })
           } finally {
-            controller.close()
+            try {
+              controller.close()
+            } catch {
+              /* already closed on early-exit path */
+            }
           }
 
-          // ── Post-stream side effects (fire-and-forget) ────────────────────
-          // All AI side-effect calls run after the stream closes so they never
-          // block the founder's experience.
-
+          // ── Post-stream side effects (usage + optional summary) ─────────────
           void (async () => {
             try {
-              // 1. Track primary chat AI usage (spec Rule 15).
-              await trackUsage(db, {
-                userId,
-                startupId,
-                generationJobId: job.id,
-                usage:           { model: usageModel, inputTokens, outputTokens },
-                purpose:         'chat',
-              })
+              if (inputTokens > 0 || outputTokens > 0) {
+                await trackUsage(db, {
+                  userId,
+                  startupId,
+                  generationJobId: job.id,
+                  usage:           { model: usageModel, inputTokens, outputTokens },
+                  purpose:         'chat',
+                })
+              }
 
               if (fallbackInputTokens > 0 || fallbackOutputTokens > 0) {
                 await trackUsage(db, {
@@ -528,34 +747,14 @@ founderSessionsRouter.post(
                 })
               }
 
-              // 2. Mark job done + increment messages_count.
+              if (!streamedQuestion || !cleanResponse) return
+
               const newCount = (session.messagesCount ?? 0) + 1
-              await Promise.all([
-                db
-                  .update(generationJobs)
-                  .set({ status: 'done', progress: 100, completedAt: new Date() })
-                  .where(eq(generationJobs.id, job.id)),
-                db
-                  .update(founderSessions)
-                  .set({ messagesCount: newCount, updatedAt: new Date() })
-                  .where(eq(founderSessions.id, sessionId)),
-              ])
-
-              // 3. Log activity.
-              await logActivity(db, {
-                userId,
-                startupId,
-                type:        'session.message_sent',
-                description: 'Founder session AI message exchanged',
-                meta:        { sessionId, jobId: job.id },
-              })
-
-              // 4. Adaptive summary trigger (unchanged from Sprint 2).
               const messagesSinceLastSummary = latestSummaryRow
                 ? newCount - (latestSummaryRow.exchangeCount ?? 0)
                 : newCount
 
-              const promptText      = systemPrompt + historyMessages.map((m) => m.content).join(' ') + message
+              const promptText = systemPrompt + historyMessages.map((m) => m.content).join(' ') + message
               const estimatedTokens = estimateTokens(promptText)
 
               if (messagesSinceLastSummary >= 15 || estimatedTokens > 12_000) {
@@ -601,129 +800,6 @@ founderSessionsRouter.post(
                   purpose:         'chat',
                 })
               }
-
-              // 5. Sprint 2.5: Extended memory extraction — captures both narrative
-              //    memory fields (Sprint 2) AND per-category confidence/evidence (Sprint 2.5).
-              const memoryRes = await openai.chat.completions.create({
-                model:           'gpt-4o',
-                response_format: { type: 'json_schema', json_schema: FOUNDER_MEMORY_EXTRACTION_SCHEMA },
-                messages: [
-                  {
-                    role:    'system',
-                    content: buildMemoryExtractionSystemPrompt(startup.name, currentMemory),
-                  },
-                  ...historyMessages.slice(-10),
-                  { role: 'user',      content: `<user_input>${message}</user_input>` },
-                  { role: 'assistant', content: cleanResponse },
-                ],
-              })
-
-              const memoryContent = memoryRes.choices[0]?.message?.content
-              if (memoryContent) {
-                let rawJson: unknown
-                try {
-                  rawJson = JSON.parse(memoryContent)
-                } catch (parseErr) {
-                  console.error('[founder memory] JSON parse failed', parseErr)
-                  rawJson = null
-                }
-
-                const slotUpdatesParsed = rawJson && typeof rawJson === 'object' && rawJson !== null && 'topic_slot_updates' in rawJson
-                  ? TopicSlotUpdatesSchema.safeParse((rawJson as { topic_slot_updates: unknown }).topic_slot_updates)
-                  : null
-                const topicSlotUpdates = slotUpdatesParsed?.success ? slotUpdatesParsed.data : []
-
-                const extracted = FounderMemorySchema.safeParse(rawJson)
-                if (!extracted.success) {
-                  console.error('[founder memory] schema validation failed', extracted.error.format())
-                }
-                if (extracted.success) {
-                  const existing = existingMemoryRow
-                    ? (FounderMemorySchema.safeParse(existingMemoryRow.memory).data ?? EMPTY_FOUNDER_MEMORY)
-                    : EMPTY_FOUNDER_MEMORY
-
-                  const merged = mergeFounderMemory(existing, extracted.data)
-
-                  if (existingMemoryRow) {
-                    await db
-                      .update(founderMemories)
-                      .set({ memory: merged, updatedAt: new Date() })
-                      .where(eq(founderMemories.sessionId, sessionId))
-                  } else {
-                    await db.insert(founderMemories).values({
-                      sessionId,
-                      startupId,
-                      userId,
-                      memory: merged,
-                    })
-                  }
-
-                  // 6. Sprint 2.5: Update founder understanding from the merged memory.
-                  //    This is the core Sprint 2.5 side effect — updates founder_understanding
-                  //    and inserts evidence_records. The result drives the progress UI and
-                  //    the gap-aware system prompt on the next turn.
-                  const understandingResult = await updateUnderstanding({
-                    db,
-                    sessionId,
-                    startupId,
-                    userId,
-                    memory:               merged,
-                    sourceMessageId:      job.id,
-                    founderStage:         sessionFounderStage,
-                    messagesCount:        newCount,
-                    marketplaceDetected:  sessionMarketplaceDetected,
-                    topicSlotUpdates,
-                    askedTopic:           plannedTopic,
-                    assistantQuestionText: cleanResponse || null,
-                  })
-
-                  // 7. Close the session when understanding is complete.
-                  //    Prevents further messages via the status guard, finalizes telemetry.
-                  if (understandingResult.isComplete) {
-                    const durationSeconds = Math.round(
-                      (Date.now() - session.createdAt.getTime()) / 1000,
-                    )
-                    await db
-                      .update(founderSessions)
-                      .set({
-                        status:                 'completed',
-                        sessionDurationSeconds: durationSeconds,
-                        updatedAt:              new Date(),
-                      })
-                      .where(eq(founderSessions.id, sessionId))
-
-                    await logActivity(db, {
-                      userId,
-                      startupId,
-                      type:        'session.completed',
-                      description: `Founder session completed for startup ${startupId}`,
-                      meta: {
-                        sessionId,
-                        founderStage:        session.founderStage ?? 'building',
-                        blueprintMode:       understandingResult.understanding.blueprintMode,
-                        overallConfidence:   understandingResult.overallConfidence,
-                        messagesCount:       session.messagesCount + 1,
-                        durationSeconds,
-                        gapsInBlueprint:     understandingResult.understanding.gapsInBlueprint,
-                        requiredConfidence: {
-                          problem:  understandingResult.understanding.categories.problem.confidence,
-                          customer: understandingResult.understanding.categories.customer.confidence,
-                          solution: understandingResult.understanding.categories.solution.confidence,
-                        },
-                      },
-                    })
-                  }
-                }
-              }
-
-              await trackUsage(db, {
-                userId,
-                startupId,
-                generationJobId: job.id,
-                usage:           fromOpenAI(memoryRes),
-                purpose:         'chat',
-              })
-
             } catch (sideEffectErr) {
               console.error('[chat side effects]', sideEffectErr)
             }
@@ -732,9 +808,9 @@ founderSessionsRouter.post(
       }),
       200,
       {
-        'Content-Type':    'text/event-stream',
-        'Cache-Control':   'no-cache',
-        'Connection':      'keep-alive',
+        'Content-Type':      'text/event-stream',
+        'Cache-Control':     'no-cache',
+        'Connection':        'keep-alive',
         'X-Accel-Buffering': 'no',
       },
     )
