@@ -7,6 +7,7 @@ import {
   normalizeAnswerChoices,
   extractChoicesJson,
 } from '../../src/modules/founder-sessions/answer-choices.ts'
+import { buildContextBlocks } from '../../src/modules/founder-sessions/answer-choices-fallback.ts'
 
 describe('requiresAnswerChoices', () => {
   it('returns true when session is not complete', () => {
@@ -15,6 +16,47 @@ describe('requiresAnswerChoices', () => {
 
   it('returns false when session is complete', () => {
     expect(requiresAnswerChoices({ ...EMPTY_UNDERSTANDING, isComplete: true })).toBe(false)
+  })
+})
+
+describe('buildContextBlocks grounding', () => {
+  it('includes planned topic and latest founder message when provided', () => {
+    const blocks = buildContextBlocks({
+      questionText: 'What must-have features should the product deliver first?',
+      startupName: 'Acme',
+      weakestCategory: 'solution',
+      sessionSummary: null,
+      founderMemory: null,
+      recentExchanges: [],
+      plannedTopic: {
+        category: 'solution',
+        topicSlot: 'mechanism',
+        depth: 'discover',
+        mustElicit: 'what the product lets the user do — must-have features and outcomes',
+        reason: 'test',
+      },
+      latestFounderMessage: 'Finance leads waste 5 days closing books in spreadsheets every month.',
+    })
+    const text = blocks.join('\n')
+    expect(text).toContain('Planned topic')
+    expect(text).toContain('Topic slot: mechanism')
+    expect(text).toContain('must-have features and outcomes')
+    expect(text).toContain('Finance leads waste 5 days')
+    expect(text).toContain('Current question:')
+  })
+
+  it('falls back to focus area when planned topic is absent', () => {
+    const blocks = buildContextBlocks({
+      questionText: 'Who is the buyer?',
+      startupName: 'Acme',
+      weakestCategory: 'customer',
+      sessionSummary: null,
+      founderMemory: null,
+      recentExchanges: [],
+    })
+    const text = blocks.join('\n')
+    expect(text).toContain('Focus area:')
+    expect(text).not.toContain('Planned topic')
   })
 })
 

@@ -470,13 +470,15 @@ founderSessionsRouter.post(
             } else if (choices.length === 0 && requiresAnswerChoices(currentUnderstanding)) {
               const ctx = await loadChoicesContext(sessionId, startup)
               const generated = await generateAnswerChoices({
-                questionText:       cleanResponse,
-                startupName:        ctx.startupName,
-                startupDescription: ctx.startupDescription,
-                weakestCategory:    ctx.currentUnderstanding.weakestCategory,
-                sessionSummary:     ctx.latestSummary,
-                founderMemory:      ctx.founderMemory,
-                recentExchanges:    ctx.recentExchanges,
+                questionText:          cleanResponse,
+                startupName:           ctx.startupName,
+                startupDescription:    ctx.startupDescription,
+                weakestCategory:       ctx.currentUnderstanding.weakestCategory,
+                sessionSummary:        ctx.latestSummary,
+                founderMemory:         ctx.founderMemory,
+                recentExchanges:       ctx.recentExchanges,
+                plannedTopic,
+                latestFounderMessage:  message,
               })
               choices = generated.choices
               fallbackInputTokens  = generated.inputTokens
@@ -835,12 +837,14 @@ founderSessionsRouter.post(
 
     const result = await generateAnswerChoices({
       questionText,
-      startupName:        ctx.startupName,
-      startupDescription: ctx.startupDescription,
-      weakestCategory:    ctx.currentUnderstanding.weakestCategory,
-      sessionSummary:     ctx.latestSummary,
-      founderMemory:      ctx.founderMemory,
-      recentExchanges:    ctx.recentExchanges,
+      startupName:           ctx.startupName,
+      startupDescription:    ctx.startupDescription,
+      weakestCategory:       ctx.currentUnderstanding.weakestCategory,
+      sessionSummary:        ctx.latestSummary,
+      founderMemory:         ctx.founderMemory,
+      recentExchanges:       ctx.recentExchanges,
+      plannedTopic:          ctx.currentUnderstanding.plannedTopic ?? null,
+      latestFounderMessage:  ctx.recentExchanges.at(-1)?.question ?? null,
     })
 
     await trackUsage(db, {

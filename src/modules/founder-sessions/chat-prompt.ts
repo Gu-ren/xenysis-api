@@ -14,7 +14,7 @@ import {
   THRESHOLD_COMPLETE,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.7' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.8' as const
 
 const VALIDATION_PLANNING_CHOICES_RULE =
   'Include <answer_choices> with exactly 3 validation-planning draft answers the founder can select and refine.'
@@ -25,29 +25,28 @@ export function requiresAnswerChoices(understanding: FounderUnderstanding): bool
 }
 
 // ── Per-category focus guidance for the gap-aware system prompt ───────────────
+// CEO-aligned: pain, customers, features/outcomes — not engineering or stack.
 
 const CATEGORY_FOCUS_GUIDANCE: Record<UnderstandingCategory, string> = {
   problem:      'the specific pain, inefficiency, or unmet need the startup addresses',
   customer:     'the exact buyer — job title, company type, size, and purchase trigger',
-  solution:     'what the product does and why it is meaningfully better than the current alternative',
-  market:       'market size (TAM/SAM/SOM), growth rate, and timing signals',
-  pricing:      'revenue model, price point, and any evidence of willingness to pay',
-  competition:  'named competitors and why customers would switch away from them',
-  risks:        'the biggest threats to viability and the key unproven assumptions',
-  // Revision 2: founder_fit probes credibility and execution capability.
+  solution:     'what the product lets users do — must-have features and outcomes, and why that beats the current workaround',
+  market:       'how widespread the pain is, who else has it, and why now (plain language — no TAM/SAM jargon in questions)',
+  pricing:      'how they plan to charge, a rough price point, and any willingness-to-pay signal',
+  competition:  'named competitors or alternatives and why customers would switch',
+  risks:        'the biggest business or customer risk and the key unproven assumption (not technical/engineering risk)',
   founder_fit:  'the founder\'s domain expertise, existing customer relationships, and what makes them uniquely positioned to win',
-  // v2.2 PR3: supply-side probes provider acquisition, quality, and retention for marketplace startups.
   supply_side:  'how supply-side participants (providers, sellers, hosts, drivers) are recruited, onboarded, quality-controlled, and retained',
 }
 
 const CATEGORY_MUST_ELICIT: Record<UnderstandingCategory, string> = {
   problem:      'pain frequency, current workaround, and cost of the status quo',
   customer:     'job title, company size, and purchase trigger',
-  solution:     'core mechanism, why it beats the current workaround, and differentiation',
-  market:       'market size estimate, growth signal, and timing',
-  pricing:      'revenue model, price point, and willingness-to-pay signal',
+  solution:     'must-have features or what users can do, why that beats the workaround, and why they would choose it',
+  market:       'how widespread the problem is, growth or demand signal, and why now',
+  pricing:      'how they charge, a rough price, and willingness-to-pay signal',
   competition:  'named alternatives and why customers would switch',
-  risks:        'biggest threat and key unproven assumption',
+  risks:        'biggest business risk and key unproven customer assumption',
   founder_fit:  'domain expertise, customer access, and execution track record',
   supply_side:  'recruitment channel, onboarding flow, and quality control',
 }
@@ -98,13 +97,32 @@ function buildPlannedTopicPromptLines(
     '- Do NOT switch to a different category or topic slot.',
     '- Do NOT ask about blocked or completed topics.',
     '- Ground the question in something the founder already said when possible.',
+    '- Phrase in plain CEO language — no technical jargon, stack, architecture, or scalability.',
   ]
+
+  if (planned.category === 'solution') {
+    lines.push(
+      '',
+      'SOLUTION SLOT — FEATURES / OUTCOMES ONLY:',
+      'Ask what the user can DO or SEE (must-have features and outcomes).',
+      'Do NOT ask how it is built, which tools they use, or how it scales.',
+    )
+  }
+
+  if (planned.category === 'market') {
+    lines.push(
+      '',
+      'MARKET — PLAIN LANGUAGE:',
+      'Ask how widespread the pain is, who else has it, or why now.',
+      'Do NOT use TAM/SAM/SOM or other market-sizing jargon in the question.',
+    )
+  }
 
   if (planned.depth === 'foundation') {
     lines.push(
       '',
       'This is the foundation kickoff. Ask one structured question covering:',
-      '"In a few sentences — who has the problem, what pain they feel, and what you\'re building to solve it."',
+      '"In a few sentences — who has the problem, what pain they feel, and what you want the product to do for them."',
       'Your <answer_choices> MUST be 3 full-paragraph seeds covering all three dimensions.',
     )
   } else if (planned.depth === 'follow_up') {
@@ -154,6 +172,7 @@ function buildPlannedTopicPromptLines(
 //   - FOCUS INSTRUCTION branches on validationStatus of the target category.
 //   - GAP IDENTIFICATION mode fires when all categories are done, validated, or confirmed gaps.
 // v2.7: Interview planner hard-injects PLANNED TOPIC when provided.
+// v2.8: CEO voice — pain/features focus; ban tech/scalability questions; grounded choices.
 export function buildChatSystemPrompt(
   startup: Startup,
   latestSummary: SessionSummary | null,
@@ -170,13 +189,21 @@ export function buildChatSystemPrompt(
   const effectivePlannedTopic = plannedTopic ?? understanding.plannedTopic ?? null
   const lines: (string | undefined)[] = [
     'You are an experienced startup advisor and AI Technical Cofounder.',
-    'Your role is to deeply understand the startup through investigative conversation.',
+    'Your role is to deeply understand the startup through investigative conversation with the founder/CEO.',
+    '',
+    '--- CEO VOICE ---',
+    'Speak like a product-minded cofounder talking to a CEO — not an engineer interviewing a CTO.',
+    'Prefer plain language: pain, who hurts, how often, workaround, money/time cost, must-have features, why switch.',
+    'Focus on problem clarity, customer, and product features/outcomes the founder wants.',
+    'Xenysis will decide scalability, architecture, stack, and software engineering later when generating the blueprint.',
+    'NEVER ask about: tech stack, frameworks, languages, databases, APIs, microservices, cloud providers,',
+    'scalability, performance, security architecture, infrastructure, or deployment.',
     '',
     'CONVERSATION RULES:',
     '1. Ask exactly ONE question per response — no lists, no surveys.',
     '2. Make each question specific and grounded in what the founder has already said.',
     '3. Do not repeat questions about categories you already understand well.',
-    '4. Ask like a VC drilling into an investment thesis — precise, probing, high-value.',
+    '4. Ask like a sharp product cofounder — precise about pain and features, never about implementation.',
     '5. When the founder is vague, your question MUST request one specific example or number — not a general restatement.',
     '6. When a founder confirms they have not validated something, acknowledge it and move on.',
     '7. The application selects the next topic. You decide HOW to ask — never switch topics on your own.',
@@ -203,9 +230,11 @@ export function buildChatSystemPrompt(
     'Answer choice rules:',
     '- Use a valid JSON array of objects, each with "label" and "text" fields.',
     '- "label": short scannable headline, max 60 characters — signal depth when useful (e.g. "With numbers", "With customer quote", "Hypothesis — needs validation").',
-    '- "text": 2–3 sentence draft answer (200–400 characters). Each draft MUST include: (1) a specific persona (role + segment), (2) a concrete trigger or example, (3) a quantified or bounded claim (frequency, cost, size, timeline).',
-    '- Ground each draft in specifics from the conversation — names, numbers, contexts the founder mentioned.',
-    '- Provide exactly 3 choices representing distinct plausible directions.',
+    '- "text": 2–3 sentence draft answer (200–400 characters). Prefer: (1) a specific persona or concrete example, (2) a trigger or situation, (3) a quantified or bounded claim when it fits the question.',
+    '- All 3 drafts MUST answer THIS question and stay on the planned topic slot — not three unrelated categories.',
+    '- Reuse names, numbers, phrases, and contexts the founder already mentioned whenever present.',
+    '- Distinct directions that still stay on-topic (e.g. different customer examples of the same pain).',
+    '- CEO language only — no stack, architecture, or scalability in the drafts.',
     '- Do NOT include choices when the session is complete or you are only summarizing.',
     '',
     '--- STARTUP CONTEXT ---',
@@ -634,11 +663,11 @@ export function buildChatSystemPrompt(
       '',
       '--- FOUNDATION KICKOFF (FIRST TURN) ---',
       'This is the start of the discovery session. Ask one structured foundation question:',
-      '"In a few sentences — who has the problem, what pain they feel, and what you\'re building to solve it."',
-      'Do NOT ask a narrow single-category question yet.',
+      '"In a few sentences — who has the problem, what pain they feel, and what you want the product to do for them."',
+      'Do NOT ask a narrow single-category question yet. Do NOT ask about tech stack or how it would be built.',
       '',
       'Your <answer_choices> MUST be 3 full-paragraph seeds, each covering ALL THREE dimensions:',
-      '  (1) who has the problem / target customer, (2) the specific pain, (3) what they are building.',
+      '  (1) who has the problem / target customer, (2) the specific pain, (3) must-have features or outcomes.',
       'Each draft should represent a distinct plausible startup direction grounded in their idea.',
     )
   }

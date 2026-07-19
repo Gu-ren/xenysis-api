@@ -263,7 +263,7 @@ describe('buildChatSystemPrompt planned topic', () => {
         category: 'solution',
         topicSlot: 'mechanism',
         depth: 'discover',
-        mustElicit: 'how the product works at a concrete level',
+        mustElicit: 'what the product lets the user do — must-have features and outcomes (not how it is built)',
         reason: 'test',
       },
     )
@@ -271,6 +271,16 @@ describe('buildChatSystemPrompt planned topic', () => {
     expect(prompt).toContain('Topic slot: mechanism')
     expect(prompt).toContain('Do NOT switch to a different category or topic slot')
     expect(prompt).toContain('application selects the next topic')
+    expect(prompt).toContain('FEATURES / OUTCOMES ONLY')
+    expect(prompt).toContain('must-have features and outcomes')
+  })
+
+  it('includes CEO VOICE and bans tech/scalability questions', () => {
+    const prompt = buildChatSystemPrompt(fakeStartup, null, EMPTY_UNDERSTANDING, 'building', false, null)
+    expect(prompt).toContain('CEO VOICE')
+    expect(prompt).toContain('NEVER ask about: tech stack')
+    expect(prompt).toContain('scalability')
+    expect(prompt).toContain('Xenysis will decide scalability')
   })
 
   it('does not inject planned topic when session is complete', () => {
@@ -294,6 +304,16 @@ describe('buildChatSystemPrompt planned topic', () => {
     )
     expect(prompt).toContain('SESSION STATUS: COMPLETE')
     expect(prompt).not.toContain('PLANNED TOPIC (MANDATORY')
+  })
+})
+
+describe('CEO-aligned SLOT_MUST_ELICIT', () => {
+  it('uses feature/outcome language for solution.mechanism', async () => {
+    const { SLOT_MUST_ELICIT } = await import('../../src/lib/contracts/interview-coverage.ts')
+    expect(SLOT_MUST_ELICIT.solution.mechanism).toMatch(/features|outcomes|lets the user do/i)
+    expect(SLOT_MUST_ELICIT.solution.mechanism).not.toMatch(/how the product works at a concrete level/)
+    expect(SLOT_MUST_ELICIT.market.size).toMatch(/widespread|who else/i)
+    expect(SLOT_MUST_ELICIT.risks.biggest_threat).toMatch(/business|customer/i)
   })
 })
 
