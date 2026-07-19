@@ -38,6 +38,8 @@ import {
 } from '../../lib/contracts/founder-understanding.ts'
 import { logActivity, trackUsage, estimateTokens, fromOpenAI } from '../../agents/base/utils.ts'
 import { updateUnderstanding, loadUnderstanding } from '../../services/understanding-engine.ts'
+import { planNextQuestion } from '../../services/interview-planner.ts'
+import { TopicSlotUpdatesSchema } from '../../lib/contracts/interview-coverage.ts'
 import { chatRateLimit } from '../../middleware/rate-limit.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
@@ -355,26 +357,25 @@ founderSessionsRouter.post(
     // even before a founder_understanding row exists.
     const sessionMarketplaceDetected = session.marketplaceDetected || currentUnderstanding.marketplaceDetected
 
-    // [TEMP DEBUG] supply_side state read from DB before prompt generation
-    const _dbSS = currentUnderstanding.categories?.supply_side
-    if (_dbSS) {
-      console.log('[DEBUG router pre-prompt] supply_side:', {
-        confidence:                  _dbSS.confidence,
-        validationStatus:            _dbSS.validationStatus,
-        saturationCount:             _dbSS.saturationCount,
-        validationPlanningCompleted: _dbSS.validationPlanningCompleted,
-        lastFocusConfidence:         _dbSS.lastFocusConfidence,
-      })
-      console.log('[DEBUG router pre-prompt] weakestCategory:', currentUnderstanding.weakestCategory)
-      // validationPlanningCandidate is a local in buildChatSystemPrompt — derive it here for debug visibility
-      const _dbVPCandidate = currentUnderstanding.categories
-        ? Object.entries(currentUnderstanding.categories).find(([cat, s]) => {
-            if (cat === 'supply_side' && !sessionMarketplaceDetected) return false
-            return s.validationStatus === 'explicitly_unvalidated' && s.saturationCount >= 1 && !s.validationPlanningCompleted
-          })?.[0] ?? null
-        : null
-      console.log('[DEBUG router pre-prompt] validationPlanningCandidate:', _dbVPCandidate)
-    }
+    // Interview engine: application selects the next topic before the chat LLM runs.
+    const plannedTopic = planNextQuestion({
+      understanding:        currentUnderstanding,
+      coverage:             currentUnderstanding.interviewCoverage,
+      questionHistory:      currentUnderstanding.questionHistory ?? [],
+      marketplaceDetected:  sessionMarketplaceDetected,
+    })
+
+    console.log('[interview-planner] plannedTopic:', plannedTopic)
+
+    await logActivity(db, {
+      userId,
+      startupId,
+      type:        'interview.topic_planned',
+      description: plannedTopic
+        ? `Planned topic ${plannedTopic.category}/${plannedTopic.topicSlot} (${plannedTopic.depth})`
+        : 'Session complete — no topic planned',
+      meta:        { sessionId, plannedTopic },
+    })
 
     const systemPrompt = buildChatSystemPrompt(
       startup,
@@ -382,6 +383,7 @@ founderSessionsRouter.post(
       currentUnderstanding,
       sessionFounderStage,
       sessionMarketplaceDetected,
+      plannedTopic,
     )
 
     // Reconstruct conversation history from session answers.
@@ -616,7 +618,20 @@ founderSessionsRouter.post(
 
               const memoryContent = memoryRes.choices[0]?.message?.content
               if (memoryContent) {
-                const extracted = FounderMemorySchema.safeParse(JSON.parse(memoryContent))
+                let rawJson: unknown
+                try {
+                  rawJson = JSON.parse(memoryContent)
+                } catch (parseErr) {
+                  console.error('[founder memory] JSON parse failed', parseErr)
+                  rawJson = null
+                }
+
+                const slotUpdatesParsed = rawJson && typeof rawJson === 'object' && rawJson !== null && 'topic_slot_updates' in rawJson
+                  ? TopicSlotUpdatesSchema.safeParse((rawJson as { topic_slot_updates: unknown }).topic_slot_updates)
+                  : null
+                const topicSlotUpdates = slotUpdatesParsed?.success ? slotUpdatesParsed.data : []
+
+                const extracted = FounderMemorySchema.safeParse(rawJson)
                 if (!extracted.success) {
                   console.error('[founder memory] schema validation failed', extracted.error.format())
                 }
@@ -655,6 +670,9 @@ founderSessionsRouter.post(
                     founderStage:         sessionFounderStage,
                     messagesCount:        newCount,
                     marketplaceDetected:  sessionMarketplaceDetected,
+                    topicSlotUpdates,
+                    askedTopic:           plannedTopic,
+                    assistantQuestionText: cleanResponse || null,
                   })
 
                   // 7. Close the session when understanding is complete.

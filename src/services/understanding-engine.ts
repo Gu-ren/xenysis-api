@@ -17,6 +17,14 @@ import {
   FounderUnderstandingSchema,
   computeEarlyExitEligible,
 } from '../lib/contracts/founder-understanding.ts'
+import {
+  appendQuestionHistory,
+  createEmptyInterviewCoverage,
+  mergeInterviewCoverage,
+  type PlannedTopic,
+  type QuestionHistoryEntry,
+  type TopicSlotUpdate,
+} from '../lib/contracts/interview-coverage.ts'
 
 // Per-turn novelty classification for each category.
 //   new:              New evidence items were extracted this turn.
@@ -39,6 +47,12 @@ export interface UpdateUnderstandingParams {
   messagesCount?:  number
   // v2.2 PR2: seed from the session-init heuristic; OR'd with existing understanding for stickiness.
   marketplaceDetected?: boolean
+  // Interview engine: slot hits from this turn's extraction (sufficiency).
+  topicSlotUpdates?: TopicSlotUpdate[]
+  // Planner output that drove the AI question this turn (for history + adaptive depth).
+  askedTopic?: PlannedTopic | null
+  // Clean assistant question text for duplicate history.
+  assistantQuestionText?: string | null
 }
 
 export interface UpdateUnderstandingResult {
@@ -60,7 +74,7 @@ export interface UpdateUnderstandingResult {
 export async function updateUnderstanding(
   params: UpdateUnderstandingParams,
 ): Promise<UpdateUnderstandingResult> {
-  const { db, sessionId, startupId, userId, memory, sourceMessageId, founderStage = 'building', messagesCount = 0, marketplaceDetected: seedMarketplaceDetected = false } = params
+  const { db, sessionId, startupId, userId, memory, sourceMessageId, founderStage = 'building', messagesCount = 0, marketplaceDetected: seedMarketplaceDetected = false, topicSlotUpdates = [], askedTopic = null, assistantQuestionText = null } = params
 
   // Load existing row to access accumulated evidence (never lost across turns).
   const existingRow = await db.query.founderUnderstanding.findFirst({
@@ -212,6 +226,35 @@ export async function updateUnderstanding(
     computeEarlyExitEligible(understanding) &&
     messagesCount >= MIN_EXCHANGES[founderStage]
   understanding = { ...understanding, earlyExitEligible }
+
+  // Interview engine: merge topic-slot coverage + question history (JSONB-additive).
+  const priorCoverage = existingUnderstanding.interviewCoverage ?? createEmptyInterviewCoverage()
+  const mergedCoverage = mergeInterviewCoverage(priorCoverage, topicSlotUpdates, {
+    turnCount: messagesCount,
+    askedSlot: askedTopic
+      ? { category: askedTopic.category, topicSlot: askedTopic.topicSlot }
+      : null,
+    multiIcpDetected: understanding.multiIcpDetected,
+    marketplaceDetected: understanding.marketplaceDetected,
+  })
+
+  let questionHistory: QuestionHistoryEntry[] = existingUnderstanding.questionHistory ?? []
+  if (askedTopic && assistantQuestionText) {
+    questionHistory = appendQuestionHistory(questionHistory, {
+      text:      assistantQuestionText.slice(0, 2000),
+      category:  askedTopic.category,
+      topicSlot: askedTopic.topicSlot,
+      turn:      messagesCount,
+    })
+  }
+
+  understanding = {
+    ...understanding,
+    interviewCoverage: mergedCoverage,
+    questionHistory,
+    // Persist the topic that drove this turn's question (adaptive depth on next plan).
+    plannedTopic: askedTopic ?? existingUnderstanding.plannedTopic ?? null,
+  }
 
   // Determine evidence items that are new this turn.
   const newEvidenceByCategory: Partial<Record<UnderstandingCategory, string[]>> = {}

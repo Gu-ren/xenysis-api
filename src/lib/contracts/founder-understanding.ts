@@ -1,4 +1,12 @@
 import { z } from 'zod'
+import {
+  InterviewCoverageSchema,
+  PlannedTopicSchema,
+  QuestionHistoryEntrySchema,
+  type InterviewCoverage,
+  type PlannedTopic,
+  type QuestionHistoryEntry,
+} from './interview-coverage.ts'
 
 export const UNDERSTANDING_SCHEMA_VERSION = '1.1' as const
 
@@ -289,8 +297,17 @@ export const FounderUnderstandingSchema = z.object({
 
   // Set when founder clicks Continue Discovery — raises re-trigger threshold to 90%.
   earlyExitDismissed: z.boolean().default(false),
+
+  // Interview engine: topic-slot coverage drives question selection only.
+  // Category confidence remains the OA/completion source of truth.
+  interviewCoverage: InterviewCoverageSchema.optional(),
+  questionHistory:   z.array(QuestionHistoryEntrySchema).max(40).default([]),
+  // Last planner output injected into the chat prompt for this turn (debug + adaptive depth).
+  plannedTopic:      PlannedTopicSchema.nullable().optional(),
 })
 export type FounderUnderstanding = z.infer<typeof FounderUnderstandingSchema>
+
+export type { InterviewCoverage, PlannedTopic, QuestionHistoryEntry }
 
 // ── Pure computation ──────────────────────────────────────────────────────────
 
@@ -739,6 +756,8 @@ export function buildUnderstanding(params: {
     // earlyExitEligible is computed in updateUnderstanding where messagesCount is available.
     earlyExitEligible: false,
     earlyExitDismissed: false,
+    questionHistory: [],
+    plannedTopic: null,
   }
 }
 
@@ -788,6 +807,8 @@ export const EMPTY_UNDERSTANDING: FounderUnderstanding = {
   pivotCount:          0,
   earlyExitEligible:   false,
   earlyExitDismissed:  false,
+  questionHistory:     [],
+  plannedTopic:        null,
 }
 
 // ── UI progress model ─────────────────────────────────────────────────────────

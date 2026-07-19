@@ -2,6 +2,7 @@ import type { Startup } from '../../lib/db/schema/startups.ts'
 import type { SessionSummary } from '../../lib/contracts/session-summary.ts'
 import type { FounderUnderstanding, UnderstandingCategory, FounderStage } from '../../lib/contracts/founder-understanding.ts'
 import type { FounderMemory } from '../../lib/contracts/founder-memory.ts'
+import type { PlannedTopic } from '../../lib/contracts/interview-coverage.ts'
 import {
   CATEGORY_DISPLAY,
   EVIDENCE_STRENGTH_LEVELS,
@@ -13,7 +14,7 @@ import {
   THRESHOLD_COMPLETE,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.6' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.7' as const
 
 const VALIDATION_PLANNING_CHOICES_RULE =
   'Include <answer_choices> with exactly 3 validation-planning draft answers the founder can select and refine.'
@@ -74,12 +75,85 @@ function getEffectiveSaturationThresholdForPrompt(
   return SATURATION_THRESHOLD
 }
 
+/** Hard constraint block — application selects topic; LLM only phrases the question. */
+function buildPlannedTopicPromptLines(
+  planned: PlannedTopic,
+  understanding: FounderUnderstanding,
+  marketplaceDetected: boolean,
+): string[] {
+  const categoryName = CATEGORY_DISPLAY[planned.category].label
+  const slotLabel = planned.topicSlot.replace(/_/g, ' ')
+  const catState = understanding.categories[planned.category]
+  const lines: string[] = [
+    '',
+    '--- PLANNED TOPIC (MANDATORY — APPLICATION SELECTED) ---',
+    `Category: ${categoryName}`,
+    `Topic slot: ${slotLabel}`,
+    `Depth: ${planned.depth}`,
+    `Reason: ${planned.reason}`,
+    `Must elicit: ${planned.mustElicit}`,
+    '',
+    'HARD RULES:',
+    '- Ask exactly ONE question about this topic slot only.',
+    '- Do NOT switch to a different category or topic slot.',
+    '- Do NOT ask about blocked or completed topics.',
+    '- Ground the question in something the founder already said when possible.',
+  ]
+
+  if (planned.depth === 'foundation') {
+    lines.push(
+      '',
+      'This is the foundation kickoff. Ask one structured question covering:',
+      '"In a few sentences — who has the problem, what pain they feel, and what you\'re building to solve it."',
+      'Your <answer_choices> MUST be 3 full-paragraph seeds covering all three dimensions.',
+    )
+  } else if (planned.depth === 'follow_up') {
+    lines.push(
+      '',
+      'This is a FOLLOW-UP. The previous answer on this slot was incomplete.',
+      'Ask a more specific probe for the missing detail — an example, number, or concrete instance.',
+    )
+  } else if (planned.depth === 'validation_planning') {
+    lines.push(
+      '',
+      'VALIDATION PLANNING MODE:',
+      'Do NOT ask for more beliefs or hypotheses.',
+      'Ask how they would validate this assumption, what evidence would change their mind,',
+      'or the fastest experiment they could run.',
+      VALIDATION_PLANNING_CHOICES_RULE,
+    )
+  } else if (catState?.validationStatus === 'explicitly_unvalidated') {
+    lines.push(
+      '',
+      'This category has no external evidence — ask an UNDERSTANDING-SEEKING question only.',
+      'Frame as: "Who do you believe..." / "Why do you think..." / "What would you expect..."',
+    )
+  }
+
+  if (planned.category === 'customer' && understanding.multiIcpDetected) {
+    lines.push(
+      '',
+      'MULTI-ICP: Prefer beachhead sequencing over "who is your exact buyer".',
+    )
+  }
+
+  if (planned.category === 'supply_side' && marketplaceDetected) {
+    lines.push(
+      '',
+      'SUPPLY SIDE: Focus on providers/sellers/hosts — do not conflate with demand-side buyers.',
+    )
+  }
+
+  return lines
+}
+
 // ── System prompt builder ─────────────────────────────────────────────────────
 // v2.2: adds validation gap awareness and completion-aware questioning.
 //   - VALIDATION GAPS section blocks evidence-seeking on explicitly_unvalidated categories
 //     while allowing understanding-seeking questions.
 //   - FOCUS INSTRUCTION branches on validationStatus of the target category.
 //   - GAP IDENTIFICATION mode fires when all categories are done, validated, or confirmed gaps.
+// v2.7: Interview planner hard-injects PLANNED TOPIC when provided.
 export function buildChatSystemPrompt(
   startup: Startup,
   latestSummary: SessionSummary | null,
@@ -88,8 +162,12 @@ export function buildChatSystemPrompt(
   // v2.2 PR2: pass the session-level flag so the first-turn prompt is marketplace-aware
   // even before the understanding row exists. Falls back to understanding.marketplaceDetected.
   marketplaceDetected?: boolean,
+  // Interview engine: when set, the application has already chosen the next topic.
+  // The LLM must only phrase the question — not choose a different topic.
+  plannedTopic?: PlannedTopic | null,
 ): string {
   const effectiveMarketplaceDetected = marketplaceDetected ?? understanding.marketplaceDetected
+  const effectivePlannedTopic = plannedTopic ?? understanding.plannedTopic ?? null
   const lines: (string | undefined)[] = [
     'You are an experienced startup advisor and AI Technical Cofounder.',
     'Your role is to deeply understand the startup through investigative conversation.',
@@ -101,6 +179,7 @@ export function buildChatSystemPrompt(
     '4. Ask like a VC drilling into an investment thesis — precise, probing, high-value.',
     '5. When the founder is vague, your question MUST request one specific example or number — not a general restatement.',
     '6. When a founder confirms they have not validated something, acknowledge it and move on.',
+    '7. The application selects the next topic. You decide HOW to ask — never switch topics on your own.',
     '',
     'ANSWER CHOICES:',
     'When you ask a discovery question (NOT during session completion or closing summaries),',
@@ -184,7 +263,7 @@ export function buildChatSystemPrompt(
     )
   }
 
-  if (understanding.weakestCategory !== null) {
+  if (understanding.weakestCategory !== null || effectivePlannedTopic !== null) {
     lines.push('', '--- CURRENT UNDERSTANDING STATE ---')
 
     for (const [cat, state] of Object.entries(understanding.categories) as [UnderstandingCategory, typeof understanding.categories.problem][]) {
@@ -222,7 +301,7 @@ export function buildChatSystemPrompt(
       ? allBlocked.filter((cat) => cat !== 'customer')
       : allBlocked
 
-    if (effectiveBlockedCategories.length > 0) {
+    if (effectiveBlockedCategories.length > 0 && !effectivePlannedTopic) {
       lines.push(
         '',
         '--- BLOCKED TOPICS (DO NOT ASK ABOUT THESE) ---',
@@ -270,7 +349,10 @@ export function buildChatSystemPrompt(
       )
     }
 
-    if (understanding.isComplete) {
+    // Hard planner injection — application decides WHAT; LLM decides HOW.
+    if (effectivePlannedTopic && !understanding.isComplete && !understanding.pivotDetected) {
+      lines.push(...buildPlannedTopicPromptLines(effectivePlannedTopic, understanding, effectiveMarketplaceDetected))
+    } else if (understanding.isComplete) {
       const isHypothesis = understanding.blueprintMode === 'hypothesis'
       lines.push(
         '',
@@ -430,7 +512,10 @@ export function buildChatSystemPrompt(
           )
         }
       } else {
-        const weakest      = understanding.weakestCategory
+        const weakest = understanding.weakestCategory
+        if (weakest === null) {
+          // Planned-topic path already handled; nothing to inject for legacy focus.
+        } else {
         const weakestState = understanding.categories[weakest]
         const focusGuide   = CATEGORY_FOCUS_GUIDANCE[weakest]
         const categoryName = CATEGORY_DISPLAY[weakest].label
@@ -539,6 +624,7 @@ export function buildChatSystemPrompt(
             'Ground your question in something the founder has already mentioned.',
             'Do NOT ask about categories where confidence is already above 80%.',
           )
+        }
         }
       }
       }
@@ -727,6 +813,39 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
         required: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
         additionalProperties: false,
       },
+
+      // Interview engine: per-slot hits from this turn (sufficiency — one answer can fill many).
+      topic_slot_updates: {
+        type: 'array',
+        maxItems: 12,
+        items: {
+          type: 'object',
+          properties: {
+            category: {
+              type: 'string',
+              enum: ['problem', 'customer', 'solution', 'market', 'pricing', 'competition', 'risks', 'founder_fit', 'supply_side'],
+            },
+            slot: {
+              type: 'string',
+              enum: [
+                'pain', 'workaround', 'cost_of_status_quo', 'frequency',
+                'buyer_title', 'company_size', 'purchase_trigger', 'segments', 'beachhead',
+                'mechanism', 'differentiation', 'why_better',
+                'size', 'growth', 'timing',
+                'revenue_model', 'price_point', 'willingness_to_pay',
+                'named_alternatives', 'switch_reason',
+                'biggest_threat', 'key_assumption',
+                'domain_expertise', 'customer_access', 'execution',
+                'recruitment', 'onboarding', 'quality_control',
+              ],
+            },
+            confidence: { type: 'integer', minimum: 0, maximum: 100 },
+            evidence:   { type: 'string' },
+          },
+          required: ['category', 'slot', 'confidence', 'evidence'],
+          additionalProperties: false,
+        },
+      },
     },
     required: [
       'startup_name', 'one_sentence_pitch', 'problem', 'customer',
@@ -736,6 +855,7 @@ export const FOUNDER_MEMORY_EXTRACTION_SCHEMA = {
       'category_confidence', 'category_evidence', 'category_evidence_strength',
       'category_absence_signals', 'category_has_external_contact',
       'multi_icp_detected', 'marketplace_detected', 'pivot_detected',
+      'topic_slot_updates',
     ],
     additionalProperties: false,
   },
@@ -779,6 +899,20 @@ export function buildMemoryExtractionSystemPrompt(
     '  - Same turn also includes a quantified claim or named segment → allow 75–85 if specifics are credible.',
     '  - Extract each distinct factual claim into category_evidence[] so confidence can update.',
     '  - Do NOT route positive factual claims to category_absence_signals — they belong in category_evidence.',
+    '',
+    'TOPIC SLOT UPDATES (sufficiency — one answer can fill multiple slots):',
+    'Emit topic_slot_updates for every specific fact covered THIS TURN. Use only valid slot ids:',
+    '  problem: pain, workaround, cost_of_status_quo, frequency',
+    '  customer: buyer_title, company_size, purchase_trigger, segments, beachhead',
+    '  solution: mechanism, differentiation, why_better',
+    '  market: size, growth, timing',
+    '  pricing: revenue_model, price_point, willingness_to_pay',
+    '  competition: named_alternatives, switch_reason',
+    '  risks: biggest_threat, key_assumption',
+    '  founder_fit: domain_expertise, customer_access, execution',
+    '  supply_side: recruitment, onboarding, quality_control',
+    'confidence 0-100 per slot (60+ = complete enough to stop asking). evidence = short quote/paraphrase.',
+    'If nothing new this turn, return topic_slot_updates: [].',
     '',
     'IMPORTANT: Confidence is a LIVING score. If the founder contradicts earlier statements',
     'or reveals an assumption was wrong, lower the confidence for that category accordingly.',
