@@ -9,11 +9,17 @@ import {
 import { requireStartupOwner } from '../../lib/db/startup-queries.ts'
 import { requireAuth } from '../../middleware/auth.ts'
 import { zValidator } from '../../middleware/validate.ts'
-import { NotFoundError } from '../../middleware/errors.ts'
+import { ConflictError, NotFoundError } from '../../middleware/errors.ts'
 import { anthropic, openai } from '../../lib/ai/client.ts'
 import { BlueprintGenerationService } from '../../services/blueprint-generation-service.ts'
 import { BlueprintChatService } from '../../services/blueprint-chat-service.ts'
-import { BlueprintContentSchema } from '../../lib/contracts/blueprint.ts'
+import { analyzeBlueprintChanges } from '../../services/blueprint-analyze-service.ts'
+import { persistBlueprintVersion } from '../../services/blueprint-persist.ts'
+import { heartbeatPresence, listPresence } from '../../services/blueprint-presence.ts'
+import {
+  BlueprintContentSchema,
+  BlueprintSaveSourceSchema,
+} from '../../lib/contracts/blueprint.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
 export const blueprintRouter = new Hono<HonoEnv>()
@@ -135,6 +141,8 @@ blueprintRouter.get(
         versionId:     blueprintVersions.id,
         versionNumber: blueprintVersions.versionNumber,
         isCurrent:     blueprintVersions.isCurrent,
+        source:        blueprintVersions.source,
+        note:          blueprintVersions.note,
         generatedAt:   blueprintVersions.createdAt,
       })
       .from(blueprintVersions)
@@ -197,8 +205,8 @@ blueprintRouter.get(
 )
 
 // ── POST /:id/blueprints/chat  ← SSE ─────────────────────────────────────────
-// Accepts a natural-language instruction + current blueprint content, applies
-// AI-driven edits, streams ChatEvents back as SSE, and persists a new version.
+// Accepts a natural-language instruction + current blueprint content and streams
+// ChatEvents (including chat_suggestion). Client persists via PUT after Apply.
 const chatBodySchema = z.object({
   message:        z.string().min(1).max(2000),
   currentContent: BlueprintContentSchema,
@@ -224,5 +232,102 @@ blueprintRouter.post(
     const stream  = await service.chatStream(startupId, userId, message, currentContent, history ?? [])
 
     return c.body(stream, 200, SSE_HEADERS)
+  },
+)
+
+// ── PUT /:id/blueprints/current  ──────────────────────────────────────────────
+const saveBodySchema = z.object({
+  content:               BlueprintContentSchema,
+  source:                BlueprintSaveSourceSchema.default('manual'),
+  note:                  z.string().max(500).optional(),
+  expectedVersionNumber: z.number().int().positive().optional(),
+})
+
+blueprintRouter.put(
+  '/:id/blueprints/current',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  zValidator('json', saveBodySchema),
+  async (c) => {
+    const { id: startupId } = c.req.valid('param')
+    const userId = c.var.user.id
+    const { content, source, note, expectedVersionNumber } = c.req.valid('json')
+
+    await requireStartupOwner(startupId, userId)
+
+    try {
+      const saved = await persistBlueprintVersion(
+        db,
+        startupId,
+        content,
+        source,
+        note,
+        expectedVersionNumber,
+      )
+      return c.json({ data: saved })
+    } catch (err) {
+      if (err instanceof Error && (err as Error & { code?: string }).code === 'VERSION_CONFLICT') {
+        throw new ConflictError(
+          'Blueprint was updated elsewhere. Reload or merge before saving.',
+        )
+      }
+      throw err
+    }
+  },
+)
+
+// ── POST /:id/blueprints/analyze-changes  ─────────────────────────────────────
+const analyzeBodySchema = z.object({
+  previous: BlueprintContentSchema,
+  draft:    BlueprintContentSchema,
+})
+
+blueprintRouter.post(
+  '/:id/blueprints/analyze-changes',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  zValidator('json', analyzeBodySchema),
+  async (c) => {
+    const { id: startupId } = c.req.valid('param')
+    const userId = c.var.user.id
+    const { previous, draft } = c.req.valid('json')
+
+    await requireStartupOwner(startupId, userId)
+    const result = await analyzeBlueprintChanges(openai, previous, draft)
+    return c.json({ data: result })
+  },
+)
+
+// ── Presence (collaborative editing) ──────────────────────────────────────────
+const presenceBodySchema = z.object({
+  displayName: z.string().min(1).max(80).default('Editor'),
+  sectionId:   z.string().max(64).nullable().optional(),
+})
+
+blueprintRouter.post(
+  '/:id/blueprints/presence',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  zValidator('json', presenceBodySchema),
+  async (c) => {
+    const { id: startupId } = c.req.valid('param')
+    const userId = c.var.user.id
+    const { displayName, sectionId } = c.req.valid('json')
+
+    await requireStartupOwner(startupId, userId)
+    const peers = heartbeatPresence(startupId, userId, displayName, sectionId ?? null)
+    return c.json({ data: { peers } })
+  },
+)
+
+blueprintRouter.get(
+  '/:id/blueprints/presence',
+  requireAuth,
+  zValidator('param', startupIdParam),
+  async (c) => {
+    const { id: startupId } = c.req.valid('param')
+    const userId = c.var.user.id
+    await requireStartupOwner(startupId, userId)
+    return c.json({ data: { peers: listPresence(startupId, userId) } })
   },
 )

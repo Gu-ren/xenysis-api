@@ -571,6 +571,8 @@ export const BLUEPRINT_EXAMPLE: BlueprintContent = {
   },
 
   // ── Metrics ──────────────────────────────────────────────────────────────────
+  customSections: [],
+  customBlocks: [],
   metrics: {
     northStar: {
       name: 'Weekly Approvals Completed',

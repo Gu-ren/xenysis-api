@@ -54,6 +54,9 @@ export const blueprintVersions = pgTable(
     content: jsonb('content').notNull(),
     isCurrent: boolean('is_current').notNull().default(false),
     generationJobId: uuid('generation_job_id'),
+    // How this version was created (manual save, AI apply, restore, generate, chat).
+    source: text('source').notNull().default('generate'),
+    note: text('note'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [unique().on(t.blueprintId, t.versionNumber)],
