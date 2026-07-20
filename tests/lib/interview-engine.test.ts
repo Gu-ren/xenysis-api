@@ -4,19 +4,26 @@ import {
   mergeInterviewCoverage,
   questionSimilarity,
   isDuplicateQuestion,
+  findSimilarQuestion,
   slotRecentlyAskedSimilar,
   getIncompleteSlots,
   appendQuestionHistory,
   SLOT_ADVANCE_THRESHOLD,
+  TOPIC_SLOTS,
   type QuestionHistoryEntry,
 } from '../../src/lib/contracts/interview-coverage.ts'
-import { planNextQuestion } from '../../src/services/interview-planner.ts'
+import { planNextQuestion, slotKey } from '../../src/services/interview-planner.ts'
 import {
   EMPTY_UNDERSTANDING,
   type FounderUnderstanding,
   type UnderstandingCategory,
 } from '../../src/lib/contracts/founder-understanding.ts'
-import { buildChatSystemPrompt } from '../../src/modules/founder-sessions/chat-prompt.ts'
+import {
+  buildChatSystemPrompt,
+  buildRecentlyAskedPromptLines,
+  CHAT_PROMPT_VERSION,
+} from '../../src/modules/founder-sessions/chat-prompt.ts'
+import { resolveUniqueQuestion } from '../../src/modules/founder-sessions/unique-question.ts'
 import type { Startup } from '../../src/lib/db/schema/startups.ts'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -101,10 +108,19 @@ describe('questionSimilarity / isDuplicateQuestion', () => {
     expect(isDuplicateQuestion(b, [{ text: a, category: 'customer', topicSlot: 'buyer_title', turn: 1 }], 0.5)).toBe(true)
   })
 
+  it('detects paraphrase near-duplicates at the default threshold', () => {
+    const a = 'What specific pain do your customers feel every week and how often does it happen?'
+    const b = 'What specific pain do your customers feel every week and how often does that pain happen?'
+    expect(isDuplicateQuestion(b, [{ text: a, category: 'problem', topicSlot: 'pain', turn: 1 }])).toBe(true)
+    const matched = findSimilarQuestion(b, [{ text: a, category: 'problem', topicSlot: 'pain', turn: 1 }])
+    expect(matched?.text).toBe(a)
+  })
+
   it('does not flag unrelated questions as duplicates', () => {
     const a = 'What is your revenue model and price point?'
     const b = 'How do you recruit supply-side providers onto the platform?'
     expect(isDuplicateQuestion(b, [{ text: a, category: 'pricing', topicSlot: 'revenue_model', turn: 1 }])).toBe(false)
+    expect(findSimilarQuestion(b, [{ text: a, category: 'pricing', topicSlot: 'revenue_model', turn: 1 }])).toBeNull()
   })
 
   it('slotRecentlyAskedSimilar rotates after two asks on the same slot', () => {
@@ -114,6 +130,19 @@ describe('questionSimilarity / isDuplicateQuestion', () => {
     ]
     expect(slotRecentlyAskedSimilar('problem', 'pain', 'the specific pain', history)).toBe(true)
     expect(slotRecentlyAskedSimilar('problem', 'workaround', 'current workaround', history)).toBe(false)
+  })
+
+  it('slotRecentlyAskedSimilar rotates when mustElicit matches a prior question on the slot', () => {
+    const mustElicit = 'the specific pain or unmet need the startup addresses'
+    const history: QuestionHistoryEntry[] = [
+      {
+        text: 'Tell me about the specific pain or unmet need the startup addresses for customers',
+        category: 'problem',
+        topicSlot: 'pain',
+        turn: 1,
+      },
+    ]
+    expect(slotRecentlyAskedSimilar('problem', 'pain', mustElicit, history, 0.4)).toBe(true)
   })
 })
 
@@ -233,20 +262,67 @@ describe('planNextQuestion', () => {
     }
 
     const plan = planNextQuestion({ understanding, coverage, questionHistory: history })
-    // Should not stay on pain forever — either different slot or still pain via fallback
     expect(plan).not.toBeNull()
-    if (plan!.depth === 'follow_up') {
-      // follow_up only if slotRecentlyAskedSimilar returned false — with 2 history entries it should rotate
-      expect(plan!.topicSlot).not.toBe('pain')
-    } else {
-      expect(plan!.topicSlot).not.toBe('pain')
+    expect(plan!.topicSlot).not.toBe('pain')
+    expect(plan!.depth).not.toBe('follow_up')
+  })
+
+  it('rotates to the next category when every incomplete slot on a category was recently asked', () => {
+    const coverage = createEmptyInterviewCoverage()
+    const history: QuestionHistoryEntry[] = []
+    let turn = 1
+    for (const slot of TOPIC_SLOTS.problem) {
+      history.push(
+        { text: `First ask about problem ${slot} details please`, category: 'problem', topicSlot: slot, turn: turn++ },
+        { text: `Second ask about problem ${slot} more details`, category: 'problem', topicSlot: slot, turn: turn++ },
+      )
     }
+
+    const understanding = withCategoryConfidence({
+      ...EMPTY_UNDERSTANDING,
+      questionHistory: history,
+    }, { problem: 25, customer: 15, solution: 15 })
+
+    const plan = planNextQuestion({ understanding, coverage, questionHistory: history })
+    expect(plan).not.toBeNull()
+    expect(plan!.category).not.toBe('problem')
+  })
+
+  it('skips foundation kickoff when problem:pain is in skippedSlots and picks another slot', () => {
+    const plan = planNextQuestion({
+      understanding: EMPTY_UNDERSTANDING,
+      skippedSlots: new Set([slotKey('problem', 'pain')]),
+    })
+    // Kickoff is blocked; planner falls through to required sprint on another problem slot.
+    expect(plan).not.toBeNull()
+    expect(plan!.depth).not.toBe('foundation')
+    expect(`${plan!.category}:${plan!.topicSlot}`).not.toBe('problem:pain')
+  })
+
+  it('honors skippedSlots during replan after a duplicate', () => {
+    const coverage = createEmptyInterviewCoverage()
+    const understanding = withCategoryConfidence(EMPTY_UNDERSTANDING, {
+      problem: 40,
+      customer: 20,
+      solution: 20,
+    })
+    const plan = planNextQuestion({
+      understanding,
+      coverage,
+      skippedSlots: new Set([slotKey('problem', 'pain')]),
+    })
+    expect(plan).not.toBeNull()
+    expect(`${plan!.category}:${plan!.topicSlot}`).not.toBe('problem:pain')
   })
 })
 
 // ── Prompt hard-injection ─────────────────────────────────────────────────────
 
 describe('buildChatSystemPrompt planned topic', () => {
+  it('uses founder-chat-v2.9', () => {
+    expect(CHAT_PROMPT_VERSION).toBe('founder-chat-v2.9')
+  })
+
   it('injects PLANNED TOPIC hard rules when planner provides a topic', () => {
     const understanding = withCategoryConfidence(EMPTY_UNDERSTANDING, {
       problem: 40,
@@ -273,6 +349,38 @@ describe('buildChatSystemPrompt planned topic', () => {
     expect(prompt).toContain('application selects the next topic')
     expect(prompt).toContain('FEATURES / OUTCOMES ONLY')
     expect(prompt).toContain('must-have features and outcomes')
+  })
+
+  it('injects RECENTLY ASKED history so the model does not repeat prior questions', () => {
+    const understanding = withCategoryConfidence({
+      ...EMPTY_UNDERSTANDING,
+      questionHistory: [
+        {
+          text: 'What pain do finance leads feel during month-end close?',
+          category: 'problem',
+          topicSlot: 'pain',
+          turn: 1,
+        },
+      ],
+    }, { problem: 40, customer: 50, solution: 30 })
+
+    const prompt = buildChatSystemPrompt(
+      fakeStartup,
+      null,
+      understanding,
+      'building',
+      false,
+      {
+        category: 'customer',
+        topicSlot: 'buyer_title',
+        depth: 'discover',
+        mustElicit: 'job title of the buyer',
+        reason: 'test',
+      },
+    )
+    expect(prompt).toContain('RECENTLY ASKED (DO NOT REPEAT)')
+    expect(prompt).toContain('what pain do finance leads feel during month end close')
+    expect(buildRecentlyAskedPromptLines(understanding.questionHistory).join('\n')).toContain('problem/pain')
   })
 
   it('includes CEO VOICE and bans tech/scalability questions', () => {
@@ -336,5 +444,102 @@ describe('getIncompleteSlots', () => {
 describe('SLOT_ADVANCE_THRESHOLD', () => {
   it('is 60', () => {
     expect(SLOT_ADVANCE_THRESHOLD).toBe(60)
+  })
+})
+
+describe('resolveUniqueQuestion', () => {
+  const prior = 'What specific pain do your customers feel every week and how often does it happen?'
+  const history: QuestionHistoryEntry[] = [
+    { text: prior, category: 'problem', topicSlot: 'pain', turn: 1 },
+  ]
+  const planned = {
+    category: 'problem' as const,
+    topicSlot: 'pain',
+    depth: 'discover' as const,
+    mustElicit: 'the specific pain',
+    reason: 'test',
+  }
+
+  it('accepts a unique first draft without regenerating', async () => {
+    const result = await resolveUniqueQuestion({
+      history,
+      initialSystemPrompt: 'system',
+      plannedTopic: planned,
+      planParams: { understanding: withCategoryConfidence(EMPTY_UNDERSTANDING, { problem: 40 }) },
+      buildSystemPrompt: () => 'system',
+      parseCleanText: (raw) => raw,
+      generate: async () => ({
+        raw: 'How do finance teams currently work around the close delay?',
+        inputTokens: 10,
+        outputTokens: 5,
+        model: 'gpt-4o',
+      }),
+    })
+    expect(result.attempts).toBe(1)
+    expect(result.replanned).toBe(false)
+    expect(result.cleanText).toContain('work around')
+  })
+
+  it('regenerates once when the first draft is a near-duplicate', async () => {
+    let calls = 0
+    const duplicate = 'What specific pain do your customers feel every week and how often does that pain happen?'
+    const unique = 'What is the current workaround when the close slips past the deadline?'
+    const result = await resolveUniqueQuestion({
+      history,
+      initialSystemPrompt: 'system',
+      plannedTopic: planned,
+      planParams: { understanding: withCategoryConfidence(EMPTY_UNDERSTANDING, { problem: 40 }) },
+      buildSystemPrompt: () => 'system',
+      parseCleanText: (raw) => raw,
+      generate: async () => {
+        calls += 1
+        return {
+          raw: calls === 1 ? duplicate : unique,
+          inputTokens: 10,
+          outputTokens: 5,
+          model: 'gpt-4o',
+        }
+      },
+    })
+    expect(result.attempts).toBe(2)
+    expect(result.replanned).toBe(false)
+    expect(result.cleanText).toBe(unique)
+  })
+
+  it('replans to another slot when regenerate is still a duplicate', async () => {
+    const duplicate = 'What specific pain do your customers feel every week and how often does that pain happen?'
+    const afterReplan = 'Who is the buyer title that owns the month-end close process?'
+    let calls = 0
+    const understanding = withCategoryConfidence(EMPTY_UNDERSTANDING, {
+      problem: 40,
+      customer: 20,
+      solution: 20,
+    })
+    const result = await resolveUniqueQuestion({
+      history,
+      initialSystemPrompt: 'system',
+      plannedTopic: planned,
+      planParams: {
+        understanding,
+        coverage: createEmptyInterviewCoverage(),
+        questionHistory: history,
+      },
+      buildSystemPrompt: () => 'system-replan',
+      parseCleanText: (raw) => raw,
+      generate: async () => {
+        calls += 1
+        return {
+          raw: calls <= 2 ? duplicate : afterReplan,
+          inputTokens: 10,
+          outputTokens: 5,
+          model: 'gpt-4o',
+        }
+      },
+    })
+    expect(result.attempts).toBe(3)
+    expect(result.replanned).toBe(true)
+    expect(result.plannedTopic).not.toBeNull()
+    expect(result.plannedTopic!.topicSlot).not.toBe('pain')
+    expect(result.cleanText).toBe(afterReplan)
   })
 })

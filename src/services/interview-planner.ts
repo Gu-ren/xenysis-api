@@ -11,7 +11,6 @@ import {
   SLOT_ADVANCE_THRESHOLD,
   REQUIRED_SPRINT_THRESHOLD,
   SLOT_MUST_ELICIT,
-  TOPIC_SLOTS,
   createEmptyInterviewCoverage,
   getIncompleteSlots,
   getSlotState,
@@ -27,6 +26,8 @@ export interface PlanNextQuestionParams {
   coverage?: InterviewCoverage | null
   questionHistory?: QuestionHistoryEntry[]
   marketplaceDetected?: boolean
+  /** Slots to skip this turn (e.g. after a duplicate replan). Key: `${category}:${topicSlot}`. */
+  skippedSlots?: ReadonlySet<string>
 }
 
 /**
@@ -39,6 +40,7 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
     coverage: rawCoverage,
     questionHistory = [],
     marketplaceDetected: seedMarketplace = false,
+    skippedSlots,
   } = params
 
   if (understanding.isComplete) return null
@@ -46,24 +48,29 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
   const marketplaceDetected = seedMarketplace || understanding.marketplaceDetected
   const multiIcpDetected = understanding.multiIcpDetected
   const coverage = rawCoverage ?? understanding.interviewCoverage ?? createEmptyInterviewCoverage()
+  const pickOpts = { multiIcpDetected, marketplaceDetected, skippedSlots }
 
   // First turn: no category scores yet — foundation kickoff.
   if (understanding.weakestCategory === null && understanding.overallConfidence === 0) {
-    return {
-      category:   'problem',
-      topicSlot:  'pain',
-      depth:      'foundation',
-      mustElicit: 'who has the problem, what pain they feel, and what you are building',
-      reason:     'Foundation kickoff — elicit problem, customer, and solution in one turn',
+    const kickoffKey = slotKey('problem', 'pain')
+    if (!skippedSlots?.has(kickoffKey)) {
+      return {
+        category:   'problem',
+        topicSlot:  'pain',
+        depth:      'foundation',
+        mustElicit: 'who has the problem, what pain they feel, and what you are building',
+        reason:     'Foundation kickoff — elicit problem, customer, and solution in one turn',
+      }
     }
   }
 
   // Validation-planning takes priority when a gap category is saturated on assumptions.
   const validationCat = findValidationPlanningCandidate(understanding, marketplaceDetected)
   if (validationCat !== null) {
-    const slot = pickSlot(coverage, validationCat, { multiIcpDetected, marketplaceDetected }, questionHistory)
-      ?? TOPIC_SLOTS[validationCat][0]
-    return buildPlan(validationCat, slot, 'validation_planning', 'Validation planning for explicitly unvalidated category')
+    const slot = pickSlot(coverage, validationCat, pickOpts, questionHistory)
+    if (slot) {
+      return buildPlan(validationCat, slot, 'validation_planning', 'Validation planning for explicitly unvalidated category')
+    }
   }
 
   // Adaptive depth: re-ask last planned slot if still below advance threshold.
@@ -76,11 +83,13 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
       : SATURATION_THRESHOLD
     const saturated = (catState.saturationCount ?? 0) >= satThreshold
       && !(lastPlanned.category === 'customer' && multiIcpDetected)
+    const lastKey = slotKey(lastPlanned.category, lastPlanned.topicSlot)
 
     if (
       slotState.status !== 'complete' &&
       slotState.confidence < SLOT_ADVANCE_THRESHOLD &&
-      !saturated
+      !saturated &&
+      !skippedSlots?.has(lastKey)
     ) {
       const mustElicit = SLOT_MUST_ELICIT[lastPlanned.category][lastPlanned.topicSlot]
         ?? lastPlanned.mustElicit
@@ -98,7 +107,7 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
   // Required sprint: problem → customer → solution until each hits 60%.
   const sprintCat = getRequiredSprintCategory(understanding)
   if (sprintCat !== null) {
-    const slot = pickSlot(coverage, sprintCat, { multiIcpDetected, marketplaceDetected }, questionHistory)
+    const slot = pickSlot(coverage, sprintCat, pickOpts, questionHistory)
     if (slot) {
       return buildPlan(sprintCat, slot, 'discover', `Required sprint target: ${sprintCat}`)
     }
@@ -113,7 +122,7 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
       const lowest = lagging.reduce((a, b) =>
         (understanding.categories[a].confidence <= understanding.categories[b].confidence ? a : b),
       )
-      const slot = pickSlot(coverage, lowest, { multiIcpDetected, marketplaceDetected }, questionHistory)
+      const slot = pickSlot(coverage, lowest, pickOpts, questionHistory)
       if (slot) {
         return buildPlan(lowest, slot, 'discover', `Gap identification — lowest required: ${lowest}`)
       }
@@ -121,6 +130,7 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
   }
 
   // Default: weakest category via existing priority formula, then first incomplete slot.
+  // Skip categories whose incomplete slots are all similar/recently asked — rotate instead of looping.
   const saturationCounts = Object.fromEntries(
     Object.entries(understanding.categories).map(([cat, state]) => [cat, state.saturationCount ?? 0]),
   ) as Partial<Record<UnderstandingCategory, number>>
@@ -139,16 +149,18 @@ export function planNextQuestion(params: PlanNextQuestionParams): PlannedTopic |
 
   const candidates = buildCandidateOrder(understanding, weakest, marketplaceDetected)
   for (const cat of candidates) {
-    const slot = pickSlot(coverage, cat, { multiIcpDetected, marketplaceDetected }, questionHistory)
+    const slot = pickSlot(coverage, cat, pickOpts, questionHistory)
     if (slot) {
       return buildPlan(cat, slot, 'discover', `Weakest/priority category: ${cat}`)
     }
   }
 
-  // Fallback: ask anything incomplete on weakest even if duplicate-filtered emptied the list.
-  const fallbackSlot = getIncompleteSlots(coverage, weakest, { multiIcpDetected, marketplaceDetected })[0]
-    ?? TOPIC_SLOTS[weakest][0]
-  return buildPlan(weakest, fallbackSlot, 'discover', `Fallback to weakest category: ${weakest}`)
+  // No non-similar incomplete slot remains — let the chat layer close / wait rather than loop.
+  return null
+}
+
+export function slotKey(category: UnderstandingCategory, topicSlot: string): string {
+  return `${category}:${topicSlot}`
 }
 
 function getRequiredSprintCategory(understanding: FounderUnderstanding): UnderstandingCategory | null {
@@ -197,17 +209,22 @@ function buildCandidateOrder(
 function pickSlot(
   coverage: InterviewCoverage,
   category: UnderstandingCategory,
-  options: { multiIcpDetected?: boolean; marketplaceDetected?: boolean },
+  options: {
+    multiIcpDetected?: boolean
+    marketplaceDetected?: boolean
+    skippedSlots?: ReadonlySet<string>
+  },
   history: QuestionHistoryEntry[],
 ): string | null {
   const incomplete = getIncompleteSlots(coverage, category, options)
   for (const slot of incomplete) {
+    if (options.skippedSlots?.has(slotKey(category, slot))) continue
     const mustElicit = SLOT_MUST_ELICIT[category][slot] ?? slot
     if (slotRecentlyAskedSimilar(category, slot, mustElicit, history)) continue
     return slot
   }
-  // Prefer any incomplete even if similar, so we don't stall.
-  return incomplete[0] ?? null
+  // Do not fall back to a similar slot — caller rotates to the next category.
+  return null
 }
 
 function buildPlan(

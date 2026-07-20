@@ -2,7 +2,8 @@ import type { Startup } from '../../lib/db/schema/startups.ts'
 import type { SessionSummary } from '../../lib/contracts/session-summary.ts'
 import type { FounderUnderstanding, UnderstandingCategory, FounderStage } from '../../lib/contracts/founder-understanding.ts'
 import type { FounderMemory } from '../../lib/contracts/founder-memory.ts'
-import type { PlannedTopic } from '../../lib/contracts/interview-coverage.ts'
+import type { PlannedTopic, QuestionHistoryEntry } from '../../lib/contracts/interview-coverage.ts'
+import { normalizeQuestionText } from '../../lib/contracts/interview-coverage.ts'
 import {
   CATEGORY_DISPLAY,
   EVIDENCE_STRENGTH_LEVELS,
@@ -14,7 +15,28 @@ import {
   THRESHOLD_COMPLETE,
 } from '../../lib/contracts/founder-understanding.ts'
 
-export const CHAT_PROMPT_VERSION = 'founder-chat-v2.8' as const
+export const CHAT_PROMPT_VERSION = 'founder-chat-v2.9' as const
+
+const RECENTLY_ASKED_LIMIT = 8
+
+/** Prompt lines listing recent questions the model must not paraphrase. */
+export function buildRecentlyAskedPromptLines(
+  history: QuestionHistoryEntry[] | undefined,
+  limit: number = RECENTLY_ASKED_LIMIT,
+): string[] {
+  if (!history || history.length === 0) return []
+  const recent = history.slice(-limit)
+  return [
+    '',
+    '--- RECENTLY ASKED (DO NOT REPEAT) ---',
+    'Do NOT paraphrase, rephrase, or re-ask any of these questions.',
+    'Ask something meaningfully different that elicits new information.',
+    ...recent.map((entry, i) => {
+      const text = normalizeQuestionText(entry.text) || entry.text.trim()
+      return `${i + 1}. [${entry.category}/${entry.topicSlot}] ${text}`
+    }),
+  ]
+}
 
 const VALIDATION_PLANNING_CHOICES_RULE =
   'Include <answer_choices> with exactly 3 validation-planning draft answers the founder can select and refine.'
@@ -173,6 +195,7 @@ function buildPlannedTopicPromptLines(
 //   - GAP IDENTIFICATION mode fires when all categories are done, validated, or confirmed gaps.
 // v2.7: Interview planner hard-injects PLANNED TOPIC when provided.
 // v2.8: CEO voice — pain/features focus; ban tech/scalability questions; grounded choices.
+// v2.9: Inject RECENTLY ASKED history so the model does not paraphrase prior questions.
 export function buildChatSystemPrompt(
   startup: Startup,
   latestSummary: SessionSummary | null,
@@ -381,6 +404,10 @@ export function buildChatSystemPrompt(
     // Hard planner injection — application decides WHAT; LLM decides HOW.
     if (effectivePlannedTopic && !understanding.isComplete && !understanding.pivotDetected) {
       lines.push(...buildPlannedTopicPromptLines(effectivePlannedTopic, understanding, effectiveMarketplaceDetected))
+    }
+
+    if (!understanding.isComplete) {
+      lines.push(...buildRecentlyAskedPromptLines(understanding.questionHistory))
     } else if (understanding.isComplete) {
       const isHypothesis = understanding.blueprintMode === 'hypothesis'
       lines.push(

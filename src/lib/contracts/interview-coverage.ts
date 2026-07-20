@@ -287,7 +287,19 @@ export function isDuplicateQuestion(
   history: QuestionHistoryEntry[],
   threshold: number = DUPLICATE_SIMILARITY_THRESHOLD,
 ): boolean {
-  return history.some((entry) => questionSimilarity(candidateText, entry.text) >= threshold)
+  return findSimilarQuestion(candidateText, history, threshold) !== null
+}
+
+/** First history entry whose text is Jaccard-similar to the candidate, or null. */
+export function findSimilarQuestion(
+  candidateText: string,
+  history: QuestionHistoryEntry[],
+  threshold: number = DUPLICATE_SIMILARITY_THRESHOLD,
+): QuestionHistoryEntry | null {
+  for (const entry of history) {
+    if (questionSimilarity(candidateText, entry.text) >= threshold) return entry
+  }
+  return null
 }
 
 /** True when the same category+slot has been asked enough that we should rotate. */
@@ -301,7 +313,15 @@ export function slotRecentlyAskedSimilar(
   const recent = history.filter((h) => h.category === category && h.topicSlot === topicSlot)
   if (recent.length === 0) return false
   if (recent.length >= 2) return true
-  return recent.some((h) => questionSimilarity(mustElicit, h.text) >= threshold)
+  // Intent match: mustElicit ≈ prior question on this slot
+  if (recent.some((h) => questionSimilarity(mustElicit, h.text) >= threshold)) return true
+  // Question↔question: any prior pair on this slot is a near-paraphrase
+  for (let i = 0; i < recent.length; i++) {
+    for (let j = i + 1; j < recent.length; j++) {
+      if (questionSimilarity(recent[i].text, recent[j].text) >= threshold) return true
+    }
+  }
+  return false
 }
 
 export function appendQuestionHistory(
