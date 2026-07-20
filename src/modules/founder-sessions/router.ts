@@ -44,6 +44,7 @@ import {
   appendQuestionHistory,
   type PlannedTopic,
 } from '../../lib/contracts/interview-coverage.ts'
+import { resolveUniqueQuestion } from './unique-question.ts'
 import { chatRateLimit } from '../../middleware/rate-limit.ts'
 import type { HonoEnv } from '../../types/hono.ts'
 
@@ -607,12 +608,14 @@ founderSessionsRouter.post(
             // ── 3. Plan next topic from UPDATED understanding ───────────────────
             emit({ type: 'status', data: { phase: 'planning' } })
 
-            plannedTopic = planNextQuestion({
+            const planParams = {
               understanding:       workingUnderstanding,
               coverage:            workingUnderstanding.interviewCoverage,
               questionHistory:     workingUnderstanding.questionHistory ?? [],
               marketplaceDetected: sessionMarketplaceDetected || workingUnderstanding.marketplaceDetected,
-            })
+            }
+
+            plannedTopic = planNextQuestion(planParams)
 
             console.log('[interview-planner] plannedTopic:', plannedTopic)
 
@@ -626,48 +629,101 @@ founderSessionsRouter.post(
               meta: { sessionId, plannedTopic },
             })
 
-            systemPrompt = buildChatSystemPrompt(
-              startup,
-              latestSummary,
-              workingUnderstanding,
-              sessionFounderStage,
-              sessionMarketplaceDetected || workingUnderstanding.marketplaceDetected,
-              plannedTopic,
-            )
+            const makeSystemPrompt = (topic: PlannedTopic | null) =>
+              buildChatSystemPrompt(
+                startup,
+                latestSummary,
+                workingUnderstanding,
+                sessionFounderStage,
+                sessionMarketplaceDetected || workingUnderstanding.marketplaceDetected,
+                topic,
+              )
 
-            // ── 4. Stream next question + choices ───────────────────────────────
+            systemPrompt = makeSystemPrompt(plannedTopic)
+
+            // ── 4. Generate next question (buffered until duplicate check passes) ─
             emit({ type: 'status', data: { phase: 'thinking' } })
 
-            const stream = await openai.chat.completions.create({
-              model:          'gpt-4o',
-              stream:         true,
-              stream_options: { include_usage: true },
-              messages: [
-                { role: 'system', content: systemPrompt },
-                ...historyMessages,
-                { role: 'user',   content: `<user_input>${message}</user_input>` },
-              ],
-            })
-
-            for await (const chunk of stream) {
-              const delta = chunk.choices[0]?.delta?.content ?? ''
-              if (delta) {
-                fullResponse += delta
-                const visibleText = stripAnswerChoicesBlock(fullResponse)
-                const visibleDelta = visibleText.slice(lastVisibleLen)
-                lastVisibleLen = visibleText.length
-                if (visibleDelta) {
-                  emit({ type: 'delta', data: { content: visibleDelta } })
-                }
-              }
-              if (chunk.usage) {
-                inputTokens  = chunk.usage.prompt_tokens    ?? 0
-                outputTokens = chunk.usage.completion_tokens ?? 0
-                usageModel   = chunk.model ?? 'gpt-4o'
+            const questionHistory = workingUnderstanding.questionHistory ?? []
+            const generateBuffered = async (args: {
+              systemPrompt: string
+              antiDuplicateSuffix?: string
+            }) => {
+              const systemContent = args.antiDuplicateSuffix
+                ? `${args.systemPrompt}\n${args.antiDuplicateSuffix}`
+                : args.systemPrompt
+              const completion = await openai.chat.completions.create({
+                model: 'gpt-4o',
+                messages: [
+                  { role: 'system', content: systemContent },
+                  ...historyMessages,
+                  { role: 'user', content: `<user_input>${message}</user_input>` },
+                ],
+              })
+              const raw = completion.choices[0]?.message?.content ?? ''
+              return {
+                raw,
+                inputTokens:  completion.usage?.prompt_tokens ?? 0,
+                outputTokens: completion.usage?.completion_tokens ?? 0,
+                model:        completion.model ?? 'gpt-4o',
               }
             }
 
+            if (plannedTopic && !workingUnderstanding.isComplete) {
+              const unique = await resolveUniqueQuestion({
+                history:             questionHistory,
+                initialSystemPrompt: systemPrompt,
+                plannedTopic,
+                planParams,
+                buildSystemPrompt: makeSystemPrompt,
+                generate:          generateBuffered,
+                parseCleanText:    (raw) => parseAnswerChoices(raw).text,
+                onStatus: (phase) => {
+                  emit({ type: 'status', data: { phase } })
+                },
+                onDuplicateBlocked: async ({ attempt, candidate, matched, similarity }) => {
+                  await logActivity(db, {
+                    userId,
+                    startupId,
+                    type:        'interview.question_duplicate_blocked',
+                    description: `Duplicate question blocked (${attempt})`,
+                    meta: {
+                      sessionId,
+                      attempt,
+                      similarity,
+                      candidate: candidate.slice(0, 500),
+                      matchedText: matched.text.slice(0, 500),
+                      matchedSlot: `${matched.category}/${matched.topicSlot}`,
+                      plannedTopic,
+                    },
+                  })
+                },
+              })
+
+              fullResponse = unique.raw
+              cleanResponse = unique.cleanText
+              plannedTopic = unique.plannedTopic
+              inputTokens = unique.inputTokens
+              outputTokens = unique.outputTokens
+              usageModel = unique.model
+              systemPrompt = makeSystemPrompt(plannedTopic)
+            } else {
+              // Closing / no planned topic — single buffered generation, no duplicate gate.
+              const generated = await generateBuffered({ systemPrompt })
+              fullResponse = generated.raw
+              cleanResponse = parseAnswerChoices(fullResponse).text
+              inputTokens = generated.inputTokens
+              outputTokens = generated.outputTokens
+              usageModel = generated.model
+            }
+
             streamedQuestion = true
+            const visibleText = stripAnswerChoicesBlock(fullResponse)
+            if (visibleText) {
+              emit({ type: 'delta', data: { content: visibleText } })
+              lastVisibleLen = visibleText.length
+            }
+
             const parsed = parseAnswerChoices(fullResponse)
             cleanResponse = parsed.text
             let choices = parsed.choices
